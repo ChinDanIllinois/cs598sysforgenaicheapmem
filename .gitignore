@@ -1,0 +1,15 @@
+.env
+.DS_Store
+.vscode/
+**/.DS_Store
+**/logs
+**/qdrant_data
+**/results
+**/__pycache__/
+**/*.egg-info/
+all-MiniLM-L6-v2/
+lightmem-venv/
+llmlingua-2-bert-base-multilingual-cased-meetingbank/
+logs/
+longmemeval-cleaned/
+qdrant_data/
