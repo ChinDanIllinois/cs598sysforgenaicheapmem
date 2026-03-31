@@ -11,7 +11,6 @@ from lightmem.memory.lightmem import LightMemory
 
 
 # =========== LLM Model Configuration ============
-API_KEY='AIzaSyD6OVSwsHtKCJT1-LucgBtMLayhMAqLCBU'
 API_BASE_URL='gemini_base_url'
 LLM_MODEL='gemini-3-flash' # such as 'gpt-4o-mini' (API) or 'gemma3:latest' (Local Ollama) ...
 EMBEDDING_MODEL_PATH='/your/path/to/models/all-MiniLM-L6-v2'
