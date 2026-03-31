@@ -8,6 +8,10 @@ from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 
+import os
+import dotenv
+dotenv.load_dotenv()
+
 from lightmem.memory.lightmem import LightMemory
 
 # ============================================================
@@ -21,13 +25,13 @@ CONFIG = {
 }
 
 # ============ LightMem Configuration ============
-your_ollama_model_name = "gemma3:27b-cloud"  # such as "llama3:latest"
-your_ollama_host = "http://localhost:11434"  # default Ollama host is "http://localhost:11434"
+your_ollama_model_name = os.getenv("OLLAMA_MODEL_NAME")
+your_ollama_host = os.getenv("OLLAMA_HOST")
 
 # ============ Small Model Paths ============
-LLMLINGUA_MODEL_PATH = "/Users/chinmaydandekar/Desktop/i/CS 598 - Systems for GenAI/lightmem-playground/llmlingua-2-bert-base-multilingual-cased-meetingbank"
-EMBEDDING_MODEL_PATH = "/Users/chinmaydandekar/Desktop/i/CS 598 - Systems for GenAI/lightmem-playground/all-MiniLM-L6-v2"
-QDRANT_DATA_DIR = "/Users/chinmaydandekar/Desktop/i/CS 598 - Systems for GenAI/lightmem-playground/qdrant_data"
+LLMLINGUA_MODEL_PATH = os.getenv("LLMLINGUA_MODEL_PATH")
+EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH")
+QDRANT_DATA_DIR = os.getenv("QDRANT_DATA_DIR")
 
 def load_lightmem(collection_name):
     config = {
