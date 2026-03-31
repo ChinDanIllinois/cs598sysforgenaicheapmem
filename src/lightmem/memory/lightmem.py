@@ -4,6 +4,7 @@ import copy
 import concurrent
 import logging
 import json
+import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Literal, Optional, List, Tuple, Union
@@ -370,6 +371,134 @@ class LightMemory:
         self.logger.info(f"[{call_id}] Created {len(memory_entries)} MemoryEntry objects")
         for i, mem in enumerate(memory_entries):
             self.logger.debug(f"[{call_id}] MemoryEntry[{i}]: time={mem.time_stamp}, weekday={mem.weekday}, speaker_id={mem.speaker_id}, speaker_name={mem.speaker_name}, topic_id={mem.topic_id}, memory={mem.memory}")
+
+        if self.config.update == "online":
+            self.online_update(memory_entries)
+        elif self.config.update == "offline":
+            self.offline_update(memory_entries)
+        
+        self.logger.info(
+            f"[{call_id}] Cumulative token stats - "
+            f"Total API calls: {self.token_stats['add_memory_calls']}, "
+            f"Total tokens: {self.token_stats['add_memory_total_tokens']}"
+        )
+        return result
+
+    async def add_memory_async(
+        self,
+        messages,
+        METADATA_GENERATE_PROMPT: Optional[Union[str, Dict[str, str]]] = None,
+        *,
+        force_segment: bool = False, 
+        force_extract: bool = False
+    ):
+        """Asynchronous version of add_memory."""
+        extract_prompts = normalize_extraction_prompts(
+            prompts=METADATA_GENERATE_PROMPT,
+            extraction_mode=self.config.extraction_mode,
+            logger=self.logger
+        )
+        call_id = f"add_memory_async_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        self.logger.info(f"========== START {call_id} ==========")
+        self.logger.info(f"force_segment={force_segment}, force_extract={force_extract}")
+        result = {
+            "add_input_prompt": [],
+            "add_output_prompt": [],
+            "api_call_nums": 0
+        }
+        if isinstance(messages, list):
+            self.logger.debug(f"[{call_id}] Raw input sample: {json.dumps(messages)}")
+        normalizer = MessageNormalizer(offset_ms=500)
+        msgs = normalizer.normalize_messages(messages)
+        
+        if self.config.pre_compress:
+            if hasattr(self.compressor, "tokenizer") and self.compressor.tokenizer is not None:
+                args = (msgs, self.compressor.tokenizer)
+            elif self.config.topic_segment and hasattr(self.segmenter, "tokenizer") and self.segmenter.tokenizer is not None:
+                args = (msgs, self.segmenter.tokenizer)
+            else:
+                args = (msgs,)
+            compressed_messages = self.compressor.compress(*args)
+        else:
+            compressed_messages = msgs
+            self.logger.info(f"[{call_id}] Pre-compression disabled, using normalized messages")
+        
+        if not self.config.topic_segment:
+            self.logger.info(f"[{call_id}] Topic segmentation disabled, returning emitted messages")
+            return {
+                "triggered": True,
+                "cut_index": len(msgs),
+                "boundaries": [0, len(msgs)],
+                "emitted_messages": msgs,
+                "carryover_size": 0,
+            }
+
+        all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
+
+        if force_segment:
+            all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+        
+        if not all_segments:
+            return result
+
+        extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
+
+        if extract_trigger_num == 0:
+            return result
+        
+        global GLOBAL_TOPIC_IDX
+        topic_id_mapping = []
+        for api_call_segments in extract_list:
+            api_call_topic_ids = []
+            for topic_segment in api_call_segments:
+                api_call_topic_ids.append(GLOBAL_TOPIC_IDX)
+                GLOBAL_TOPIC_IDX += 1
+            topic_id_mapping.append(api_call_topic_ids)
+            
+        extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
+        max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
+        
+        if self.config.metadata_generate and self.config.text_summary:
+            self.logger.info(f"[{call_id}] Starting metadata generation")
+            if hasattr(self.manager, "meta_text_extract_async"):
+                extracted_results = await self.manager.meta_text_extract_async(
+                    extract_list=extract_list,
+                    messages_use=self.config.messages_use,
+                    topic_id_mapping=topic_id_mapping,
+                    extraction_mode=self.config.extraction_mode,
+                    custom_prompts=extract_prompts  
+                )
+            else:
+                loop = asyncio.get_event_loop()
+                extracted_results = await loop.run_in_executor(
+                    None, 
+                    lambda: self.manager.meta_text_extract(
+                        extract_list=extract_list,
+                        messages_use=self.config.messages_use,
+                        topic_id_mapping=topic_id_mapping,
+                        extraction_mode=self.config.extraction_mode,
+                        custom_prompts=extract_prompts  
+                    )
+                )
+
+            process_extraction_results(
+                extracted_results=extracted_results,
+                token_stats=self.token_stats,
+                result_dict=result,
+                call_id=call_id,
+                logger=self.logger
+            )
+            self.logger.info(f"[{call_id}] Metadata generation completed with {result['api_call_nums']} API calls")
+
+        memory_entries = convert_extraction_results_to_memory_entries(
+            extracted_results=extracted_results,
+            timestamps_list=timestamps_list,
+            weekday_list=weekday_list,
+            speaker_list=speaker_list,
+            topic_id_map=topic_id_map,
+            max_source_ids=max_source_ids,
+            logger=self.logger
+        )
 
         if self.config.update == "online":
             self.online_update(memory_entries)
