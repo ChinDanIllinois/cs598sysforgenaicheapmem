@@ -2,39 +2,39 @@ import json
 import ollama
 import os
 import time
+import asyncio
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from lightmem.memory.lightmem import LightMemory
 
 import dotenv
 dotenv.load_dotenv()
 
-from lightmem.memory.lightmem import LightMemory
-
-
 # =========== Ollama Configuration ============
-your_ollama_model_name = "gemma3:12b-cloud"  # such as "llama3:latest"
-your_ollama_JUDGE_model_name = "gemma3:12b-cloud"  # such as "gemma3:latest"
-your_ollama_host = "http://localhost:11434"  # default Ollama host is "http://localhost:11434"
+your_ollama_model_name = os.getenv("OLLAMA_MODEL_NAME", "kimi-k2.5:cloud")
+your_ollama_JUDGE_model_name = os.getenv("OLLAMA_JUDGE_MODEL_NAME", "kimi-k2.5:cloud")
+# Gemma3 is used for LightMem's internal memory manager because it reliably
+# returns valid JSON for metadata generation. Kimi returns empty responses
+# to those prompts, causing "JSON decoding error" and 0 memories stored.
+your_ollama_MEMORY_MANAGER_model_name = os.getenv("OLLAMA_MEMORY_MANAGER_MODEL_NAME", "gemma3:27b-cloud")
+your_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 your_ollama_options_stable = {
-    "num_ctx": 8192,  # set according to the model's context window
+    "num_ctx": 8192,
     "seed": 42,
     "top_k": 1,
     "top_p": 1.0,
     "temperature": 0.0,
     "repeat_penalty": 1.0,
-}  # a stable settings of options for evaluation
+}
 
 # ============ Small Model Paths ============
-LLMLINGUA_MODEL_PATH=os.getenv("LLMLINGUA_MODEL_PATH")
-EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH")
+LLMLINGUA_MODEL_PATH = os.getenv("LLMLINGUA_MODEL_PATH", "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank")
+EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "sentence-transformers/all-MiniLM-L6-v2")
 
 # ============ Data Configuration ============
-DATA_PATH=os.getenv("DATA_PATH")
-QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR")
+DATA_PATH = os.getenv("DATA_PATH", r"C:\Users\Pranav Premchand\Documents\cs598 systems for genai\project_code\LightMem\examples\longmemeval_s_cleaned.json")
+QDRANT_DATA_DIR = os.getenv("QDRANT_DATA_DIR", "../qdrant_data")
 
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
@@ -55,8 +55,9 @@ def get_anscheck_prompt(task, question, answer, response, abstention=False):
             raise NotImplementedError
     else:
         template = "I will give you an unanswerable question, an explanation, and a response from a model. Please answer yes if the model correctly identifies the question as unanswerable. The model could say that the information is incomplete, or some other information is given but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\nModel Response: {}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only."
-        prompt = template.format(question, answer, response) 
+        prompt = template.format(question, answer, response)
     return prompt
+
 
 def true_or_false(response):
     if response is None:
@@ -78,6 +79,7 @@ def true_or_false(response):
     if "no" in first_line:
         return False
     return False
+
 
 def load_lightmem(collection_name):
     config = {
@@ -106,9 +108,9 @@ def load_lightmem(collection_name):
         "memory_manager": {
             "model_name": "ollama",
             "configs": {
-                "model": your_ollama_model_name,
+                "model": your_ollama_MEMORY_MANAGER_model_name,
                 "host": your_ollama_host,
-                "max_tokens": 16384,  # set according to the model's context window
+                "max_tokens": 16384,
             }
         },
         "extract_threshold": 0.1,
@@ -145,10 +147,6 @@ def load_lightmem(collection_name):
 
 
 class OllamaModel:
-    """
-    An example Ollama model class for generating responses using the Ollama API.
-    You can customize this class as needed to fit your application.
-    """
     def __init__(
             self,
             model_name: str,
@@ -160,20 +158,20 @@ class OllamaModel:
         self.host = host
         self.headers = headers
         self.ollama_options = ollama_options
-        self.client = ollama.Client(host=self.host, headers=self.headers)
+        self.client = ollama.AsyncClient(host=self.host, headers=self.headers, timeout=300.0)
 
-    def call(self, messages: List[Dict[str, str]], **kwargs):
+    async def call(self, messages: List[Dict[str, str]], **kwargs):
         max_retries = kwargs.get("max_retries", 3)
-    
+
         for attempt in range(max_retries):
             try:
-                completion = self.client.chat(
+                completion = await self.client.chat(
                     model=self.name,
                     messages=messages,
                     options=self.ollama_options,
                 )
                 response = completion['message']['content']
-                print(response)
+                print(f"\nModel Response: {response}")
                 return response
 
             except ollama.ResponseError as e:
@@ -187,12 +185,14 @@ class OllamaModel:
                 print(f"[Retry {attempt + 1}/{max_retries}]  {type(e).__name__}: {e}")
                 if attempt == max_retries - 1:
                     raise
+                await asyncio.sleep(2)
 
 
-def main():
+async def main():
     proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_dir = os.path.join(proj_root, "results")
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
     llm = OllamaModel(
         model_name=your_ollama_model_name,
@@ -203,8 +203,8 @@ def main():
         ollama_options=your_ollama_options_stable,
     )
 
-    data = json.load(open(DATA_PATH, "r"))
-    data = data[:1]  # for testing
+    data = json.load(open(DATA_PATH, "r", encoding="utf-8"))
+    data = data[:2]  # Set this to higher (like [:5] or [:20]) to benchmark multiple agents!
 
     INIT_RESULT = {
         "add_input_prompt": [],
@@ -212,21 +212,25 @@ def main():
         "api_call_nums": 0
     }
 
-    for item in tqdm(data):
+    for item in data:
         item["question"] = "What fitness goal am I working towards?"
-        print(item["question"])
+
+    async def process_item(item):
+        print(f"Processing item: {item['question_id']}")
         lightmem = load_lightmem(collection_name=item["question_id"])
         sessions = item["haystack_sessions"][:10]
         timestamps = item["haystack_dates"][:10]
 
         results_list = []
-
         time_start = time.time()
+        
         for session, timestamp in zip(sessions, timestamps):
             while session and session[0]["role"] != "user":
                 session.pop(0)
-            num_turns = len(session) // 2  
+            num_turns = len(session) // 2
             for turn_idx in range(num_turns):
+                await asyncio.sleep(0)  # Yield explicitly to allow other agents to progress their turns concurrently
+                
                 turn_messages = session[turn_idx*2 : turn_idx*2 + 2]
                 if len(turn_messages) < 2 or turn_messages[0]["role"] != "user" or turn_messages[1]["role"] != "assistant":
                     continue
@@ -235,7 +239,7 @@ def main():
                 is_last_turn = (
                     session is sessions[-1] and turn_idx == num_turns - 1
                 )
-                result = lightmem.add_memory(
+                result = await lightmem.add_memory_async(
                     messages=turn_messages,
                     force_segment=is_last_turn,
                     force_extract=is_last_turn,
@@ -253,7 +257,7 @@ def main():
             "role": "user",
             "content": f"Question time:{item['question_date']} and question:{item['question']}\nPlease answer the question based on the following memories: {str(related_memories)}"
         })
-        generated_answer = llm.call(messages)
+        generated_answer = await llm.call(messages)
 
         if 'abs' in item["question_id"]:
             prompt = get_anscheck_prompt(
@@ -264,8 +268,7 @@ def main():
                 item["question_type"], item["question"], item["answer"], generated_answer
             )
         messages = [{"role": "user", "content": prompt}]
-        response = llm_judge.call(messages)
-
+        response = await llm_judge.call(messages)
         correct = 1 if true_or_false(response) else 0
 
         save_data = {
@@ -280,8 +283,12 @@ def main():
         filename = os.path.join(out_dir, f"result_{item['question_id']}.json")
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(save_data, f, ensure_ascii=False, indent=4)
+            
+        return save_data
+        
+    tasks = [process_item(item) for item in data]
+    await asyncio.gather(*tasks)
 
 
-# Ollama test:
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

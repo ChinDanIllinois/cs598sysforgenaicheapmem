@@ -1,6 +1,6 @@
 import concurrent
 import json
-import time
+import asyncio
 from typing import Dict, List, Optional, Literal, Any, Union
 
 try:
@@ -21,6 +21,7 @@ class OllamaManager:
             raise ValueError("Ollama model is not specified. Refer to https://ollama.com/docs/models for available models.")
 
         self.client = ollama.Client(host=self.config.host or "http://localhost:11434")
+        self.async_client = ollama.AsyncClient(host=self.config.host or "http://localhost:11434")
 
     def _parse_response(self, response, tools):
         """
@@ -88,7 +89,6 @@ class OllamaManager:
             "stop": self.config.stop,
         }
         
-        start_time = time.perf_counter()
         completion = self.client.chat(
             model=self.config.model,
             messages=messages,
@@ -106,14 +106,61 @@ class OllamaManager:
                 "stop": params["stop"],
             }
         )
-        time_taken = time.perf_counter() - start_time
 
         response = self._parse_response(completion, tools)
         usage_info = {
             "prompt_tokens": completion.get("prompt_eval_count", 0),
             "completion_tokens": completion.get("eval_count", 0),
             "total_tokens": completion.get("prompt_eval_count", 0) + completion.get("eval_count", 0),
-            "time_taken": time_taken,
+        }
+
+        return response, usage_info
+
+    async def generate_response_async(
+        self,
+        messages: List[Dict[str, str]],
+        response_format: Optional[Union[str, Dict[str, str]]] = None,
+        tools: Optional[List[Dict]] = None,
+        think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    ) -> tuple[Optional[str], Dict[str, int]]:
+        """Asynchronous version of generate_response."""
+        
+        if self.async_client is None:
+            raise ValueError("Ollama async client is not initialized.")
+
+        params =  {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "seed": self.config.seed,
+            "temperature": self.config.temperature,
+            "top_k": self.config.top_k,
+            "top_p": self.config.top_p,
+            "stop": self.config.stop,
+        }
+        
+        completion = await self.async_client.chat(
+            model=self.config.model,
+            messages=messages,
+            format=response_format,
+            tools=tools,
+            think=think,
+            options={
+                "num_gpu": self.config.num_gpu,
+                "main_gpu": self.config.main_gpu,
+                "num_ctx": params["max_tokens"],
+                "seed": params["seed"],
+                "temperature": params["temperature"],
+                "top_k": params["top_k"],
+                "top_p": params["top_p"],
+                "stop": params["stop"],
+            }
+        )
+
+        response = self._parse_response(completion, tools)
+        usage_info = {
+            "prompt_tokens": completion.get("prompt_eval_count", 0),
+            "completion_tokens": completion.get("eval_count", 0),
+            "total_tokens": completion.get("prompt_eval_count", 0) + completion.get("eval_count", 0),
         }
 
         return response, usage_info
@@ -216,3 +263,84 @@ class OllamaManager:
                 results = [None] * len(extract_list)
 
         return results
+
+    async def meta_text_extract_async(
+        self,
+        extract_list: List[List[List[Dict]]],
+        custom_prompts: Optional[Dict[str, str]] = None,
+        topic_id_mapping: Optional[List[List[int]]] = None,
+        extraction_mode: Literal["flat", "event"] = "flat",
+        messages_use: Literal["user_only", "assistant_only", "hybrid"] = "user_only",
+        semaphore_limit: int = 5
+    ) -> List[Optional[Dict]]:
+        """Asynchronous version of meta_text_extract using asyncio.Semaphore."""
+        if not extract_list:
+            return []
+            
+        default_prompts = EXTRACTION_PROMPTS.get(extraction_mode, {})
+        prompts = default_prompts if custom_prompts is None else {**default_prompts, **custom_prompts}
+        system_prompt = prompts.get("factual", METADATA_GENERATE_PROMPT)
+
+        def concatenate_messages(segment: List[Dict], messages_use: str) -> str:
+            role_filter = {
+                "user_only": {"user"},
+                "assistant_only": {"assistant"},
+                "hybrid": {"user", "assistant"}
+            }
+            if messages_use not in role_filter:
+                raise ValueError(f"Invalid messages_use value: {messages_use}")
+
+            allowed_roles = role_filter[messages_use]
+            message_lines = []
+            for mes in segment:
+                if mes.get("role") in allowed_roles:
+                    sequence_id = mes["sequence_number"]
+                    role = mes["role"]
+                    content = mes.get("content", "")
+                    message_lines.append(f"{sequence_id}.{role}: {content}")
+            return "\n".join(message_lines)
+            
+        semaphore = asyncio.Semaphore(semaphore_limit)
+
+        async def process_segment_async(api_call_segments: List[List[Dict]]) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    user_prompt_parts = []
+                    for idx, topic_segment in enumerate(api_call_segments, start=1):
+                        topic_text = concatenate_messages(topic_segment, messages_use)
+                        user_prompt_parts.append(f"--- Topic {idx} ---\n{topic_text}")
+
+                    user_prompt = "\n".join(user_prompt_parts)
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+                    
+                    raw_response, usage_info = await self.generate_response_async(
+                        messages=messages,
+                        response_format="json"
+                    )
+                    cleaned_result = clean_response(raw_response)
+                    return {
+                        "input_prompt": messages,
+                        "output_prompt": raw_response,
+                        "cleaned_result": cleaned_result,
+                        "usage": usage_info
+                    }
+                except Exception as e:
+                    print(f"Error processing API call: {e}")
+                    return {
+                        "input_prompt": [],
+                        "output_prompt": "",
+                        "cleaned_result": [],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    }
+
+        tasks = [process_segment_async(segments) for segments in extract_list]
+        try:
+            results = await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"Error in async processing: {e}")
+            results = [None] * len(extract_list)
+
+        return list(results)
