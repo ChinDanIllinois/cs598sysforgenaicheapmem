@@ -1,10 +1,16 @@
 """
-LightMem Load Test Harness — Ollama Backend
+LightMem Load Test Harness — Backend-Agnostic Profiler
 Realistic workload from LongMemEval dataset.
 Tracks throughput, E2E latency (mean/p50/p95/p99), error rate,
 LLM/embedding call rates, avg call times, and pipeline stage breakdown.
+
+Usage:
+    python lightmem_profiler.py --provider ollama
+    python lightmem_profiler.py --provider gemini
+    python lightmem_profiler.py --provider openai
 """
 
+import argparse
 import asyncio
 import csv
 import io
@@ -13,11 +19,13 @@ import time
 import threading
 import uuid
 import datetime
+import sys
+import textwrap
 import numpy as np
 from collections import deque
 
-from dash import Dash, dcc, html, callback_context
-from dash.dependencies import Input, Output, State
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 
 import os
@@ -26,23 +34,254 @@ dotenv.load_dotenv()
 
 from lightmem.memory.lightmem import LightMemory
 
+
 # ============================================================
-# CONFIG
+# CLI ARGUMENT PARSING
 # ============================================================
 
-CONFIG = {
-    "concurrency_levels": [1, 2, 4, 8, 16, 32],
-    "test_seconds": 20,
-    "dashboard_port": 8051,
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="LightMem Load Test Harness — model-backend-agnostic profiler.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Supported providers:
+              ollama   — Local Ollama server (requires OLLAMA_MODEL_NAME, OLLAMA_HOST)
+              gemini   — Google Gemini API  (requires GEMINI_MODEL_NAME, GEMINI_API_KEY)
+              openai   — OpenAI API         (requires OPENAI_MODEL_NAME, OPENAI_API_KEY)
+
+            All providers also require the following shared env vars:
+              DATA_PATH            — Path to LongMemEval dataset JSON
+              LLMLINGUA_MODEL_PATH — Path to LLMLingua-2 model weights
+              EMBEDDING_MODEL_PATH — Path to local HuggingFace embedding model
+              QDRANT_DATA_DIR      — Directory for Qdrant vector store persistence
+        """),
+    )
+    parser.add_argument(
+        "--provider",
+        required=True,
+        choices=["ollama", "gemini", "openai"],
+        help="LLM backend provider to use for memory management.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 8, 16, 32],
+        metavar="N",
+        help="Space-separated concurrency levels to sweep (default: 1 2 4 8 16 32).",
+    )
+    parser.add_argument(
+        "--test-seconds",
+        type=int,
+        default=20,
+        metavar="SEC",
+        help="Duration of each concurrency level test in seconds (default: 20).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8051,
+        metavar="PORT",
+        help="Dashboard port (default: 8051).",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default="",
+        metavar="NAME",
+        help=(
+            "Optional label for this run, included in the CSV filename "
+            "(e.g. 'baseline', 'batch4', 'no-compress').  "
+            "Spaces are replaced with underscores."
+        ),
+    )
+    return parser.parse_args()
+
+
+# ============================================================
+# ENVIRONMENT VARIABLE VALIDATION
+# ============================================================
+
+# Shared env vars required by every provider.
+_SHARED_ENV_VARS = {
+    "LLMLINGUA_MODEL_PATH": (
+        "Path to the LLMLingua-2 model weights used for prompt compression and "
+        "topic segmentation.  Example: /models/llmlingua2"
+    ),
+    "EMBEDDING_MODEL_PATH": (
+        "Path to the local HuggingFace sentence-embedding model.  "
+        "Example: /models/all-MiniLM-L6-v2"
+    ),
+    "QDRANT_DATA_DIR": (
+        "Directory where Qdrant will persist its vector store collections.  "
+        "Example: /data/qdrant"
+    ),
 }
 
-DATA_PATH = os.getenv("DATA_PATH")
+# Per-provider env vars.  Each entry is (env_var_name, human_description).
+_PROVIDER_ENV_VARS = {
+    "ollama": [
+        (
+            "OLLAMA_MODEL_NAME",
+            "The name of the Ollama model to use (e.g. 'llama3', 'mistral').  "
+            "Run `ollama list` to see available models.",
+        ),
+        (
+            "OLLAMA_HOST",
+            "Base URL of the Ollama server (e.g. 'http://localhost:11434').  "
+            "The server must be running before starting the profiler.",
+        ),
+    ],
+    "gemini": [
+        (
+            "GEMINI_MODEL_NAME",
+            "The Gemini model identifier (e.g. 'gemini-1.5-pro', 'gemini-1.5-flash').  "
+            "See https://ai.google.dev/models for the full list.",
+        ),
+        (
+            "GEMINI_API_KEY",
+            "Your Google AI Studio or Vertex AI API key.  "
+            "Obtain one at https://aistudio.google.com/app/apikey",
+        ),
+    ],
+    "openai": [
+        (
+            "OPENAI_MODEL_NAME",
+            "The OpenAI model identifier (e.g. 'gpt-4o', 'gpt-4-turbo').  "
+            "See https://platform.openai.com/docs/models for the full list.",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "Your OpenAI API key.  "
+            "Obtain one at https://platform.openai.com/api-keys",
+        ),
+    ],
+}
+
+
+def validate_env(provider: str) -> None:
+    """
+    Check that all required environment variables are set for the given provider.
+    Prints a clear, actionable error for every missing variable and exits if any
+    are absent.
+    """
+    missing: list[tuple[str, str]] = []
+
+    # Check shared vars (DATA_PATH is optional — warn but don't error)
+    for var, description in _SHARED_ENV_VARS.items():
+        if not os.getenv(var):
+            missing.append((var, description))
+
+    # Check provider-specific vars
+    for var, description in _PROVIDER_ENV_VARS[provider]:
+        if not os.getenv(var):
+            missing.append((var, description))
+
+    if missing:
+        lines = [
+            "",
+            "╔══════════════════════════════════════════════════════════════════╗",
+            f"║  ERROR: Missing required environment variables for provider: {provider:<6}║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+        ]
+        for var, description in missing:
+            lines.append(f"║  ✗  {var}")
+            # Word-wrap the description to 62 chars so it fits in the box
+            wrapped = textwrap.wrap(description, width=62)
+            for wline in wrapped:
+                lines.append(f"║       {wline}")
+            lines.append("║")
+        lines += [
+            "║  Set the variables above in your shell or in a .env file,",
+            "║  then re-run the profiler.",
+            "╚══════════════════════════════════════════════════════════════════╝",
+            "",
+        ]
+        print("\n".join(lines), file=sys.stderr)
+        sys.exit(1)
+
+    # Soft warning for DATA_PATH (synthetic workload will be used if absent)
+    if not os.getenv("DATA_PATH") or not os.path.exists(os.getenv("DATA_PATH", "")):
+        print(
+            "WARNING: DATA_PATH is not set or the file does not exist — "
+            "the profiler will fall back to a synthetic workload.",
+            file=sys.stderr,
+        )
+
+
+# ============================================================
+# CONFIG (populated after arg parse)
+# ============================================================
+
+args = parse_args()
+validate_env(args.provider)
+
+# Resolve the model name from the appropriate env var for the chosen provider.
+_MODEL_NAME_ENV = {
+    "ollama": "OLLAMA_MODEL_NAME",
+    "gemini": "GEMINI_MODEL_NAME",
+    "openai": "OPENAI_MODEL_NAME",
+}
+_resolved_model_name = os.getenv(_MODEL_NAME_ENV[args.provider], "unknown")
+
+CONFIG = {
+    "provider":           args.provider,
+    "model_name":         _resolved_model_name,
+    "run_name":           args.run_name.strip().replace(" ", "_"),
+    "concurrency_levels": args.concurrency,
+    "test_seconds":       args.test_seconds,
+    "dashboard_port":     args.port,
+}
+
+DATA_PATH            = os.getenv("DATA_PATH")
 LLMLINGUA_MODEL_PATH = os.getenv("LLMLINGUA_MODEL_PATH")
 EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH")
-QDRANT_DATA_DIR = os.getenv("QDRANT_DATA_DIR")
+QDRANT_DATA_DIR      = os.getenv("QDRANT_DATA_DIR")
 
-your_ollama_model_name = os.getenv("OLLAMA_MODEL_NAME")
-your_ollama_host = os.getenv("OLLAMA_HOST")
+
+# ============================================================
+# PROVIDER-SPECIFIC MEMORY MANAGER CONFIG BUILDERS
+# ============================================================
+
+def _memory_manager_config_ollama() -> dict:
+    return {
+        "model_name": "ollama",
+        "configs": {
+            "model": os.getenv("OLLAMA_MODEL_NAME"),
+            "host":  os.getenv("OLLAMA_HOST"),
+            "max_tokens": 16384,
+        },
+    }
+
+
+def _memory_manager_config_gemini() -> dict:
+    return {
+        "model_name": "gemini",
+        "configs": {
+            "model":      os.getenv("GEMINI_MODEL_NAME"),
+            "api_key":    os.getenv("GEMINI_API_KEY"),
+            "max_tokens": 16384,
+        },
+    }
+
+
+def _memory_manager_config_openai() -> dict:
+    return {
+        "model_name": "openai",
+        "configs": {
+            "model":      os.getenv("OPENAI_MODEL_NAME"),
+            "api_key":    os.getenv("OPENAI_API_KEY"),
+            "max_tokens": 16384,
+        },
+    }
+
+
+_MEMORY_MANAGER_BUILDERS = {
+    "ollama": _memory_manager_config_ollama,
+    "gemini": _memory_manager_config_gemini,
+    "openai": _memory_manager_config_openai,
+}
+
 
 # ============================================================
 # DATASET LOADING
@@ -51,14 +290,14 @@ your_ollama_host = os.getenv("OLLAMA_HOST")
 def load_dataset(data_path: str):
     """
     Load all (messages, timestamp) pairs from LongMemEval dataset.
-    Returns a flat list of (turn_messages, timestamp) tuples ready for add_memory.
+    Returns a flat list of turn_messages lists ready for add_memory.
     """
     with open(data_path, "r") as f:
         data = json.load(f)
 
     samples = []
     for item in data:
-        sessions = item.get("haystack_sessions", [])
+        sessions   = item.get("haystack_sessions", [])
         timestamps = item.get("haystack_dates", [])
         for session, timestamp in zip(sessions, timestamps):
             # Align to user-start
@@ -73,7 +312,6 @@ def load_dataset(data_path: str):
                     or turn_messages[1]["role"] != "assistant"
                 ):
                     continue
-                # Stamp with session timestamp
                 tagged = []
                 for msg in turn_messages:
                     m = dict(msg)
@@ -88,7 +326,6 @@ if DATA_PATH and os.path.exists(DATA_PATH):
     DATASET = load_dataset(DATA_PATH)
     print(f"Dataset loaded: {len(DATASET)} conversation turns available.")
 else:
-    # Fallback synthetic workload if dataset unavailable
     print("WARNING: DATA_PATH not set or missing — using synthetic workload.")
     DATASET = None
 
@@ -101,9 +338,8 @@ def get_current_timestamp():
 def get_sample(worker_id: int, i: int):
     """Return a message list for this worker's i-th request."""
     if DATASET:
-        idx = (worker_id * 10007 + i) % len(DATASET)  # deterministic spread
+        idx = (worker_id * 10007 + i) % len(DATASET)
         return DATASET[idx]
-    # Synthetic fallback
     return [
         {
             "role": "user",
@@ -122,61 +358,57 @@ def get_sample(worker_id: int, i: int):
 # LIGHTMEM SETUP
 # ============================================================
 
-def load_lightmem(collection_name):
+def load_lightmem(collection_name: str) -> LightMemory:
+    provider = CONFIG["provider"]
+    memory_manager_cfg = _MEMORY_MANAGER_BUILDERS[provider]()
+
     config = {
         "pre_compress": True,
         "pre_compressor": {
             "model_name": "llmlingua-2",
             "configs": {
                 "llmlingua_config": {
-                    "model_name": LLMLINGUA_MODEL_PATH,
-                    "device_map": "cpu",
+                    "model_name":    LLMLINGUA_MODEL_PATH,
+                    "device_map":    "cpu",
                     "use_llmlingua2": True,
                 },
                 "compress_config": {"rate": 0.6},
             },
         },
-        "topic_segment": True,
+        "topic_segment":        True,
         "precomp_topic_shared": True,
-        "topic_segmenter": {"model_name": "llmlingua-2"},
-        "messages_use": "user_only",
-        "metadata_generate": True,
-        "text_summary": True,
-        "memory_manager": {
-             "model_name": "ollama",
-            "configs": {
-                "model": your_ollama_model_name,
-                "host": your_ollama_host,
-                "max_tokens": 16384,
-            }
-        },
-        "extract_threshold": 0.1,
-        "index_strategy": "embedding",
+        "topic_segmenter":      {"model_name": "llmlingua-2"},
+        "messages_use":         "user_only",
+        "metadata_generate":    True,
+        "text_summary":         True,
+        "memory_manager":       memory_manager_cfg,
+        "extract_threshold":    0.1,
+        "index_strategy":       "embedding",
         "text_embedder": {
             "model_name": "huggingface",
             "configs": {
-                "model": EMBEDDING_MODEL_PATH,
+                "model":          EMBEDDING_MODEL_PATH,
                 "embedding_dims": 384,
-                "model_kwargs": {"device": "cpu"},
+                "model_kwargs":   {"device": "cpu"},
             },
         },
         "retrieve_strategy": "embedding",
         "embedding_retriever": {
             "model_name": "qdrant",
             "configs": {
-                "collection_name": collection_name,
+                "collection_name":      collection_name,
                 "embedding_model_dims": 384,
                 "path": f"{QDRANT_DATA_DIR}/{collection_name}",
             },
         },
         "update": "offline",
         "logging": {
-            "level": "INFO",
-            "file_enabled": True,
-            "log_dir": "logs",
-            "log_filename_prefix": "run",
-            "console_enabled": True,
-            "file_level": "DEBUG",
+            "level":                "INFO",
+            "file_enabled":         True,
+            "log_dir":              "logs",
+            "log_filename_prefix":  "run",
+            "console_enabled":      True,
+            "file_level":           "DEBUG",
         },
     }
     return LightMemory.from_config(config)
@@ -184,50 +416,51 @@ def load_lightmem(collection_name):
 
 def reset_stats(mem):
     mem.token_stats = {
-        "add_memory_calls": 0,
-        "add_memory_prompt_tokens": 0,
-        "add_memory_completion_tokens": 0,
-        "add_memory_total_tokens": 0,
-        "add_memory_time": 0.0,
-        "update_calls": 0,
-        "update_prompt_tokens": 0,
-        "update_completion_tokens": 0,
-        "update_total_tokens": 0,
-        "update_time": 0.0,
-        "embedding_calls": 0,
-        "embedding_total_tokens": 0,
-        "embedding_time": 0.0,
-        "summarize_calls": 0,
-        "summarize_prompt_tokens": 0,
-        "summarize_completion_tokens": 0,
-        "summarize_total_tokens": 0,
-        "summarize_time": 0.0,
-        "stage_compress_time": 0.0,
-        "stage_segment_time": 0.0,
-        "stage_llm_extract_time": 0.0,
-        "stage_db_insert_time": 0.0,
+        "add_memory_calls":              0,
+        "add_memory_prompt_tokens":      0,
+        "add_memory_completion_tokens":  0,
+        "add_memory_total_tokens":       0,
+        "add_memory_time":               0.0,
+        "update_calls":                  0,
+        "update_prompt_tokens":          0,
+        "update_completion_tokens":      0,
+        "update_total_tokens":           0,
+        "update_time":                   0.0,
+        "embedding_calls":               0,
+        "embedding_total_tokens":        0,
+        "embedding_time":                0.0,
+        "summarize_calls":               0,
+        "summarize_prompt_tokens":       0,
+        "summarize_completion_tokens":   0,
+        "summarize_total_tokens":        0,
+        "summarize_time":                0.0,
+        "stage_compress_time":           0.0,
+        "stage_segment_time":            0.0,
+        "stage_llm_extract_time":        0.0,
+        "stage_db_insert_time":          0.0,
     }
     if hasattr(mem, "text_embedder") and hasattr(mem.text_embedder, "reset_stats"):
         mem.text_embedder.reset_stats()
 
 
-print("Initializing LightMem...")
+print(f"Initializing LightMem with provider: {CONFIG['provider']} ...")
 collection_id = "load_test_" + uuid.uuid4().hex[:8]
 memory = load_lightmem(collection_id)
 print("LightMem initialized.")
+
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
 current_concurrency = None
-current_running = False
-sweep_finished = False
+current_running     = False
+sweep_finished      = False
 
-live_timestamps = deque(maxlen=500)
-live_throughput = deque(maxlen=500)
-live_latency = deque(maxlen=500)
-live_llm_rate = deque(maxlen=500)
+live_timestamps    = deque(maxlen=500)
+live_throughput    = deque(maxlen=500)
+live_latency       = deque(maxlen=500)
+live_llm_rate      = deque(maxlen=500)
 live_embedding_rate = deque(maxlen=500)
 
 latency_samples: list[float] = []
@@ -235,23 +468,23 @@ latency_samples_lock = threading.Lock()
 
 sweep_results: list[dict] = []
 
-metrics_lock = threading.Lock()
-total_writes = 0
-total_latency = 0.0
-total_errors = 0
+metrics_lock   = threading.Lock()
+total_writes   = 0
+total_latency  = 0.0
+total_errors   = 0
 total_attempts = 0
+
 
 # ============================================================
 # WORKERS
 # ============================================================
-
 
 async def worker(worker_id, stop_event):
     global total_writes, total_latency, total_errors, total_attempts
     i = 0
     while not stop_event.is_set():
         messages = get_sample(worker_id, i)
-        start_t = time.perf_counter()
+        start_t  = time.perf_counter()
         with metrics_lock:
             total_attempts += 1
         try:
@@ -263,7 +496,7 @@ async def worker(worker_id, stop_event):
             )
             duration = time.perf_counter() - start_t
             with metrics_lock:
-                total_writes += 1
+                total_writes  += 1
                 total_latency += duration
             with latency_samples_lock:
                 latency_samples.append(duration)
@@ -278,19 +511,18 @@ async def worker(worker_id, stop_event):
 # SINGLE CONCURRENCY RUN
 # ============================================================
 
-
 async def run_single_concurrency(concurrency):
     global current_running, current_concurrency
     global total_writes, total_latency, total_errors, total_attempts
 
     print(f"\nRunning concurrency={concurrency}")
     current_concurrency = concurrency
-    current_running = True
+    current_running     = True
 
     reset_stats(memory)
-    total_writes = 0
-    total_latency = 0.0
-    total_errors = 0
+    total_writes   = 0
+    total_latency  = 0.0
+    total_errors   = 0
     total_attempts = 0
 
     with latency_samples_lock:
@@ -303,33 +535,33 @@ async def run_single_concurrency(concurrency):
     live_embedding_rate.clear()
 
     stop_event = asyncio.Event()
-    workers = [asyncio.create_task(worker(i, stop_event)) for i in range(concurrency)]
+    workers    = [asyncio.create_task(worker(i, stop_event)) for i in range(concurrency)]
 
-    start = time.perf_counter()
+    start       = time.perf_counter()
     last_sample = start
-    last_writes = 0
+    last_writes  = 0
     last_latency = 0.0
 
     while time.perf_counter() - start < CONFIG["test_seconds"]:
         await asyncio.sleep(1)
 
-        now = time.perf_counter()
-        elapsed = now - start
+        now      = time.perf_counter()
+        elapsed  = now - start
         interval = now - last_sample
 
         with metrics_lock:
-            writes_now = total_writes
+            writes_now  = total_writes
             latency_now = total_latency
 
-        delta_writes = writes_now - last_writes
+        delta_writes  = writes_now - last_writes
         delta_latency = latency_now - last_latency
-        throughput = delta_writes / interval
+        throughput      = delta_writes / interval
         avg_latency_sec = (delta_latency / delta_writes) if delta_writes > 0 else 0.0
 
-        stats = memory.get_token_statistics()
+        stats     = memory.get_token_statistics()
         llm_calls = stats.get("summary", {}).get("total_llm_calls", 0)
         emb_calls = stats.get("summary", {}).get("total_embedding_calls", 0)
-        llm_rate = llm_calls / elapsed if elapsed > 0 else 0
+        llm_rate       = llm_calls / elapsed if elapsed > 0 else 0
         embedding_rate = emb_calls / elapsed if elapsed > 0 else 0
 
         live_timestamps.append(elapsed)
@@ -338,21 +570,21 @@ async def run_single_concurrency(concurrency):
         live_llm_rate.append(llm_rate)
         live_embedding_rate.append(embedding_rate)
 
-        last_sample = now
-        last_writes = writes_now
+        last_sample  = now
+        last_writes  = writes_now
         last_latency = latency_now
 
     stop_event.set()
     await asyncio.gather(*workers)
 
-    total_time = time.perf_counter() - start
+    total_time  = time.perf_counter() - start
     final_stats = memory.get_token_statistics()
 
-    final_llm = final_stats.get("summary", {}).get("total_llm_calls", 0)
+    final_llm   = final_stats.get("summary", {}).get("total_llm_calls", 0)
     final_llm_t = final_stats.get("summary", {}).get("total_llm_time", 0.0)
-    final_emb = final_stats.get("summary", {}).get("total_embedding_calls", 0)
+    final_emb   = final_stats.get("summary", {}).get("total_embedding_calls", 0)
     final_emb_t = final_stats.get("summary", {}).get("total_embedding_time", 0.0)
-    stage_t = final_stats.get("stage_timings", {})
+    stage_t     = final_stats.get("stage_timings", {})
 
     with latency_samples_lock:
         samples = list(latency_samples)
@@ -363,30 +595,30 @@ async def run_single_concurrency(concurrency):
 
     with metrics_lock:
         _attempts = total_attempts
-        _errors = total_errors
-        _writes = total_writes
+        _errors   = total_errors
+        _writes   = total_writes
 
     error_rate = _errors / _attempts if _attempts > 0 else 0.0
-    n = _writes if _writes > 0 else 1
+    n          = _writes if _writes > 0 else 1
 
     sweep_results.append({
-        "concurrency": concurrency,
-        "throughput": _writes / total_time,
-        "avg_latency": total_latency / _writes if _writes > 0 else 0.0,
-        "p50": p50,
-        "p95": p95,
-        "p99": p99,
-        "error_rate": error_rate,
-        "total_writes": _writes,
-        "total_errors": _errors,
-        "llm_rate": final_llm / total_time,
-        "embedding_rate": final_emb / total_time,
-        "avg_llm_time": final_llm_t / final_llm if final_llm > 0 else 0.0,
+        "concurrency":       concurrency,
+        "throughput":        _writes / total_time,
+        "avg_latency":       total_latency / _writes if _writes > 0 else 0.0,
+        "p50":               p50,
+        "p95":               p95,
+        "p99":               p99,
+        "error_rate":        error_rate,
+        "total_writes":      _writes,
+        "total_errors":      _errors,
+        "llm_rate":          final_llm / total_time,
+        "embedding_rate":    final_emb / total_time,
+        "avg_llm_time":      final_llm_t / final_llm if final_llm > 0 else 0.0,
         "avg_embedding_time": final_emb_t / final_emb if final_emb > 0 else 0.0,
-        "stage_compress": stage_t.get("compress", 0.0) / n,
-        "stage_segment": stage_t.get("segment", 0.0) / n,
+        "stage_compress":    stage_t.get("compress", 0.0) / n,
+        "stage_segment":     stage_t.get("segment", 0.0) / n,
         "stage_llm_extract": stage_t.get("llm_extract", 0.0) / n,
-        "stage_db_insert": stage_t.get("db_insert", 0.0) / n,
+        "stage_db_insert":   stage_t.get("db_insert", 0.0) / n,
     })
 
     current_running = False
@@ -395,7 +627,6 @@ async def run_single_concurrency(concurrency):
 # ============================================================
 # FULL SWEEP
 # ============================================================
-
 
 async def run_sweep():
     global sweep_finished
@@ -408,16 +639,16 @@ async def run_sweep():
 # DASHBOARD — DESIGN SYSTEM
 # ============================================================
 
-BG = "#0f1117"
-CARD_BG = "#1a1d27"
-BORDER = "#2a2d3e"
-ACCENT = "#6366f1"
-ACCENT2 = "#22d3ee"
-ACCENT3 = "#f59e0b"
-ACCENT4 = "#10b981"
+BG         = "#0f1117"
+CARD_BG    = "#1a1d27"
+BORDER     = "#2a2d3e"
+ACCENT     = "#6366f1"
+ACCENT2    = "#22d3ee"
+ACCENT3    = "#f59e0b"
+ACCENT4    = "#10b981"
 ACCENT_ERR = "#ef4444"
-TEXT = "#e2e8f0"
-TEXT_DIM = "#64748b"
+TEXT       = "#e2e8f0"
+TEXT_DIM   = "#64748b"
 
 PLOT_LAYOUT = dict(
     paper_bgcolor=CARD_BG,
@@ -464,8 +695,14 @@ def section(title, graphs, ncols=2):
     ], style={"marginBottom": "36px"})
 
 
+_PROVIDER_LABEL = {
+    "ollama": f"Ollama ({os.getenv('OLLAMA_MODEL_NAME', 'unknown')})",
+    "gemini": f"Gemini ({os.getenv('GEMINI_MODEL_NAME', 'unknown')})",
+    "openai": f"OpenAI ({os.getenv('OPENAI_MODEL_NAME', 'unknown')})",
+}
+
 app = Dash(__name__)
-app.title = "LightMem Load Dashboard"
+app.title = f"LightMem Profiler — {CONFIG['provider'].capitalize()}"
 
 app.layout = html.Div([
 
@@ -479,7 +716,8 @@ app.layout = html.Div([
                     "color": TEXT, "fontFamily": "Inter, sans-serif",
                 }),
                 html.P(
-                    f"Realistic workload · {len(DATASET) if DATASET else 0} dataset turns · "
+                    f"Provider: {_PROVIDER_LABEL[CONFIG['provider']]}  ·  "
+                    f"{len(DATASET) if DATASET else 0} dataset turns  ·  "
                     f"concurrency sweep {CONFIG['concurrency_levels']}",
                     style={"margin": 0, "color": TEXT_DIM, "fontSize": "12px",
                            "fontFamily": "Inter, sans-serif"},
@@ -487,13 +725,12 @@ app.layout = html.Div([
             ]),
         ], style={"display": "flex", "alignItems": "center"}),
         html.Div([
-            # Download button (hidden until sweep complete)
             html.Button(
                 "⬇ Download CSV",
                 id="download_btn",
                 n_clicks=0,
                 style={
-                    "display": "none",  # shown via callback
+                    "display": "none",
                     "background": ACCENT, "color": "#fff",
                     "border": "none", "borderRadius": "8px",
                     "padding": "8px 18px", "fontSize": "13px",
@@ -549,29 +786,28 @@ app.layout = html.Div([
 # MAIN UPDATE CALLBACK
 # ============================================================
 
-
 @app.callback(
     [
-        Output("live_throughput", "figure"),
-        Output("live_latency", "figure"),
-        Output("live_llm", "figure"),
-        Output("live_embedding", "figure"),
-        Output("sweep_throughput", "figure"),
+        Output("live_throughput",           "figure"),
+        Output("live_latency",              "figure"),
+        Output("live_llm",                  "figure"),
+        Output("live_embedding",            "figure"),
+        Output("sweep_throughput",          "figure"),
         Output("sweep_latency_percentiles", "figure"),
-        Output("sweep_error_rate", "figure"),
-        Output("sweep_llm", "figure"),
-        Output("sweep_embedding", "figure"),
-        Output("avg_llm_time", "figure"),
-        Output("avg_emb_time", "figure"),
-        Output("stage_breakdown", "figure"),
-        Output("status_badge", "children"),
-        Output("download_btn", "style"),
-        Output("interval", "disabled"),
+        Output("sweep_error_rate",          "figure"),
+        Output("sweep_llm",                 "figure"),
+        Output("sweep_embedding",           "figure"),
+        Output("avg_llm_time",              "figure"),
+        Output("avg_emb_time",              "figure"),
+        Output("stage_breakdown",           "figure"),
+        Output("status_badge",              "children"),
+        Output("download_btn",              "style"),
+        Output("interval",                  "disabled"),
     ],
     [Input("interval", "n_intervals")],
 )
 def update_dashboard(n):
-    ts = list(live_timestamps)
+    ts   = list(live_timestamps)
     conc = [r["concurrency"] for r in sweep_results]
 
     # ── Live graphs ─────────────────────────────────────────
@@ -583,11 +819,10 @@ def update_dashboard(n):
                           **PLOT_LAYOUT)
         return fig
 
-    fig_lt = live_fig(live_throughput, ACCENT,
-                      f"Throughput  ·  C={current_concurrency}", "writes/sec")
-    fig_ll = live_fig(live_latency, ACCENT2, "Avg E2E Latency  ·  live", "seconds")
-    fig_lr = live_fig(live_llm_rate, ACCENT3, "LLM Calls/sec  ·  live", "calls/sec")
-    fig_le = live_fig(live_embedding_rate, ACCENT4, "Embedding Calls/sec  ·  live", "calls/sec")
+    fig_lt = live_fig(live_throughput,    ACCENT,  f"Throughput  ·  C={current_concurrency}", "writes/sec")
+    fig_ll = live_fig(live_latency,       ACCENT2, "Avg E2E Latency  ·  live",                "seconds")
+    fig_lr = live_fig(live_llm_rate,      ACCENT3, "LLM Calls/sec  ·  live",                  "calls/sec")
+    fig_le = live_fig(live_embedding_rate, ACCENT4, "Embedding Calls/sec  ·  live",            "calls/sec")
 
     # ── Sweep: Throughput ────────────────────────────────────
     fig_st = go.Figure()
@@ -601,10 +836,10 @@ def update_dashboard(n):
     # ── Sweep: Latency percentiles ───────────────────────────
     fig_slp = go.Figure()
     for key, label, color, dash in [
-        ("avg_latency", "mean", ACCENT, None),
-        ("p50", "p50", ACCENT2, None),
-        ("p95", "p95", ACCENT3, "dot"),
-        ("p99", "p99", ACCENT_ERR, "dash"),
+        ("avg_latency", "mean",  ACCENT,     None),
+        ("p50",         "p50",   ACCENT2,    None),
+        ("p95",         "p95",   ACCENT3,    "dot"),
+        ("p99",         "p99",   ACCENT_ERR, "dash"),
     ]:
         fig_slp.add_trace(make_scatter(
             conc, [r[key] for r in sweep_results], color, label,
@@ -663,10 +898,10 @@ def update_dashboard(n):
     # ── Sweep: Stage breakdown (stacked) ────────────────────
     fig_sb = go.Figure()
     stages = [
-        ("stage_compress",    "Compression",   ACCENT),
-        ("stage_segment",     "Segmentation",  ACCENT2),
-        ("stage_llm_extract", "LLM Extract",   ACCENT3),
-        ("stage_db_insert",   "DB Insert",     ACCENT4),
+        ("stage_compress",    "Compression",  ACCENT),
+        ("stage_segment",     "Segmentation", ACCENT2),
+        ("stage_llm_extract", "LLM Extract",  ACCENT3),
+        ("stage_db_insert",   "DB Insert",    ACCENT4),
     ]
     for key, label, color in stages:
         fig_sb.add_trace(go.Scatter(
@@ -729,7 +964,6 @@ def update_dashboard(n):
 # CSV DOWNLOAD CALLBACK
 # ============================================================
 
-
 @app.callback(
     Output("download_csv", "data"),
     Input("download_btn", "n_clicks"),
@@ -746,7 +980,7 @@ def download_csv(n_clicks):
         "stage_compress", "stage_segment", "stage_llm_extract", "stage_db_insert",
     ]
 
-    buf = io.StringIO()
+    buf    = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for row in sweep_results:
@@ -754,13 +988,23 @@ def download_csv(n_clicks):
                          for k, v in row.items()})
 
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return dict(content=buf.getvalue(), filename=f"lightmem_sweep_{timestamp_str}.csv")
+    provider   = CONFIG["provider"]
+    # Sanitise model name so it's safe to use in a filename
+    model_slug = CONFIG["model_name"].replace("/", "-").replace(" ", "_")
+    run_name   = CONFIG["run_name"]
+    parts      = ["lightmem_sweep", provider, model_slug]
+    if run_name:
+        parts.append(run_name)
+    parts.append(timestamp_str)
+    return dict(
+        content=buf.getvalue(),
+        filename="_".join(parts) + ".csv",
+    )
 
 
 # ============================================================
 # ENTRYPOINT
 # ============================================================
-
 
 def main():
     threading.Thread(target=lambda: asyncio.run(run_sweep()), daemon=True).start()
