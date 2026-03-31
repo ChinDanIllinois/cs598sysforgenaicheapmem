@@ -1,5 +1,6 @@
 import concurrent
 import json
+import time
 from typing import Dict, List, Optional, Literal, Any, Union
 
 try:
@@ -87,6 +88,7 @@ class OllamaManager:
             "stop": self.config.stop,
         }
         
+        start_time = time.perf_counter()
         completion = self.client.chat(
             model=self.config.model,
             messages=messages,
@@ -104,12 +106,14 @@ class OllamaManager:
                 "stop": params["stop"],
             }
         )
+        time_taken = time.perf_counter() - start_time
 
         response = self._parse_response(completion, tools)
         usage_info = {
             "prompt_tokens": completion.get("prompt_eval_count", 0),
             "completion_tokens": completion.get("eval_count", 0),
             "total_tokens": completion.get("prompt_eval_count", 0) + completion.get("eval_count", 0),
+            "time_taken": time_taken,
         }
 
         return response, usage_info

@@ -385,6 +385,7 @@ def process_extraction_results(
             token_stats["add_memory_prompt_tokens"] += usage.get("prompt_tokens", 0)
             token_stats["add_memory_completion_tokens"] += usage.get("completion_tokens", 0)
             token_stats["add_memory_total_tokens"] += usage.get("total_tokens", 0)
+            token_stats["add_memory_time"] = token_stats.get("add_memory_time", 0.0) + usage.get("time_taken", 0.0)
             logger.info(
                 f"[{call_id}] API Call {idx} tokens - "
                 f"Prompt: {usage.get('prompt_tokens', 0)}, "
@@ -531,6 +532,7 @@ def call_summary_llm(
         token_stats["summarize_prompt_tokens"] += usage_info.get("prompt_tokens", 0)
         token_stats["summarize_completion_tokens"] += usage_info.get("completion_tokens", 0)
         token_stats["summarize_total_tokens"] += usage_info.get("total_tokens", 0)
+        token_stats["summarize_time"] = token_stats.get("summarize_time", 0.0) + usage_info.get("time_taken", 0.0)
     
     if logger:
         logger.debug(

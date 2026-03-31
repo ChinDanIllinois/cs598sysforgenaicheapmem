@@ -2,6 +2,7 @@ from openai import OpenAI
 from typing import Optional, Literal
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import time
 from lightmem.configs.text_embedder.base_config import BaseTextEmbedderConfig
 
 class TextEmbedderHuggingface:
@@ -9,6 +10,7 @@ class TextEmbedderHuggingface:
         self.config = config
         self.total_calls = 0
         self.total_tokens = 0
+        self.total_time = 0.0
         if config.huggingface_base_url:
             self.client = OpenAI(base_url=config.huggingface_base_url)
             self.use_api = True
@@ -44,12 +46,15 @@ class TextEmbedderHuggingface:
             list: The embedding vector.
         """
         self.total_calls += 1
+        start_time = time.perf_counter()
         if self.config.huggingface_base_url:
             response = self.client.embeddings.create(input=text, model="tei")
+            self.total_time += time.perf_counter() - start_time
             self.total_tokens += getattr(response.usage, 'total_tokens', 0)
             return response.data[0].embedding
         else:
             result = self.model.encode(text, convert_to_numpy=True)
+            self.total_time += time.perf_counter() - start_time
             if isinstance(result, np.ndarray):
                 return result.tolist()
             else:
@@ -59,4 +64,5 @@ class TextEmbedderHuggingface:
         return {
             "total_calls": self.total_calls,
             "total_tokens": self.total_tokens,
+            "total_time": getattr(self, "total_time", 0.0),
         }

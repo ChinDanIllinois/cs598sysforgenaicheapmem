@@ -2,6 +2,7 @@ from openai import OpenAI
 from typing import Optional, List, Union
 import os
 import httpx
+import time
 from lightmem.configs.text_embedder.base_config import BaseTextEmbedderConfig
 
 
@@ -19,6 +20,7 @@ class TextEmbedderOpenAI:
         )
         self.total_calls = 0
         self.total_tokens = 0
+        self.total_time = 0.0
 
     @classmethod
     def from_config(cls, config: BaseTextEmbedderConfig):
@@ -35,13 +37,17 @@ class TextEmbedderOpenAI:
             if len(text) == 0:
                 return []
             inputs = [preprocess(x) for x in text]
+            start_time = time.perf_counter()
             resp = self.client.embeddings.create(input=inputs, **api_params)
+            self.total_time += time.perf_counter() - start_time
             self.total_calls += 1
             self.total_tokens += resp.usage.total_tokens
             return [item.embedding for item in resp.data]
         else:
             preprocessed = preprocess(text)
+            start_time = time.perf_counter()
             resp = self.client.embeddings.create(input=[preprocessed], **api_params)
+            self.total_time += time.perf_counter() - start_time
             self.total_calls += 1
             self.total_tokens += resp.usage.total_tokens
             return resp.data[0].embedding
@@ -50,4 +56,5 @@ class TextEmbedderOpenAI:
         return {
             "total_calls": self.total_calls,
             "total_tokens": self.total_tokens,
+            "total_time": getattr(self, "total_time", 0.0),
         }
