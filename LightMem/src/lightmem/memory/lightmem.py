@@ -828,6 +828,7 @@ class LightMemory:
                 retriever=self.embedding_retriever,
                 current_time=GLOBAL_LAST_SUMMARY_TIME
             )
+
             if process_all:
                 summaries.append(build_summary_item(summary_text, summary_id, Cbuf, Sk))
                 total_entries += len(Cbuf)

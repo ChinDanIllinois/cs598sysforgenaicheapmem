@@ -13,6 +13,7 @@ class MemoryManagerConfig(BaseModel):
         "ollama",
         "vllm",
         "vllm_offline",
+        "gemini",
     ]
 
     configs: Optional[dict] = Field(description="Configuration for the specific MemoryManager model", default={})
