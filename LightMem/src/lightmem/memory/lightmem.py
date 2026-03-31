@@ -145,19 +145,27 @@ class LightMemory:
             "add_memory_prompt_tokens": 0,
             "add_memory_completion_tokens": 0,
             "add_memory_total_tokens": 0,
+            "add_memory_time": 0.0,
             "update_calls": 0,
             "update_prompt_tokens": 0,
             "update_completion_tokens": 0,
             "update_total_tokens": 0,
-            "embedding_calls": 0,
-            "embedding_total_tokens": 0,
+            "update_time": 0.0,
             "summarize_calls": 0,
             "summarize_prompt_tokens": 0,
             "summarize_completion_tokens": 0,
             "summarize_total_tokens": 0,
+            "summarize_time": 0.0,
             "embedding_calls": 0,
             "embedding_total_tokens": 0,
+            "embedding_time": 0.0,
+            # Per-stage timing for add_memory pipeline
+            "stage_compress_time": 0.0,
+            "stage_segment_time": 0.0,
+            "stage_llm_extract_time": 0.0,
+            "stage_db_insert_time": 0.0,
         }
+        self._token_stats_lock = threading.Lock()
         self.logger.info("Token statistics tracking initialized")
         
         self.config = config
@@ -253,6 +261,7 @@ class LightMemory:
               weekdays, and extracted factual content.
             - Depending on `self.config.update`, the function triggers either online or offline memory updates.
         """
+        import time as _time
         extract_prompts = normalize_extraction_prompts(
             prompts=METADATA_GENERATE_PROMPT,
             extraction_mode=self.config.extraction_mode,
@@ -267,6 +276,12 @@ class LightMemory:
             "add_output_prompt": [],
             "api_call_nums": 0
         }
+        # --- Stage timings for this call ---
+        _t_compress = 0.0
+        _t_segment = 0.0
+        _t_llm_extract = 0.0
+        _t_db_insert = 0.0
+
         self.logger.debug(f"[{call_id}] Raw input type: {type(messages)}")
         if isinstance(messages, list):
             self.logger.debug(f"[{call_id}] Raw input sample: {json.dumps(messages)}")
@@ -281,7 +296,9 @@ class LightMemory:
             else:
                 args = (msgs,)
             # fixed: empty 'content' in the 'messages' of 'compress(*args)'
+            _t0 = _time.perf_counter()
             compressed_messages = self.compressor.compress(*args)
+            _t_compress = _time.perf_counter() - _t0
             cfg = getattr(self.compressor, "config", None)
             target_rate = None
             if cfg is not None:
@@ -306,10 +323,12 @@ class LightMemory:
                 "carryover_size": 0,
             }
 
+        _t0 = _time.perf_counter()
         all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
 
         if force_segment:
             all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+        _t_segment = _time.perf_counter() - _t0
         
         if not all_segments:
             self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
@@ -341,6 +360,7 @@ class LightMemory:
         self.logger.info(f"[{call_id}] Batch max_source_ids: {max_source_ids}")
         if self.config.metadata_generate and self.config.text_summary:
             self.logger.info(f"[{call_id}] Starting metadata generation")
+            _t0 = _time.perf_counter()
             extracted_results = self.manager.meta_text_extract(
                 extract_list=extract_list,
                 messages_use=self.config.messages_use,
@@ -348,6 +368,7 @@ class LightMemory:
                 extraction_mode=self.config.extraction_mode,
                 custom_prompts=extract_prompts  
             )
+            _t_llm_extract = _time.perf_counter() - _t0
             # ============ API token Consumption ============
             process_extraction_results(
                 extracted_results=extracted_results,
@@ -371,15 +392,29 @@ class LightMemory:
         for i, mem in enumerate(memory_entries):
             self.logger.debug(f"[{call_id}] MemoryEntry[{i}]: time={mem.time_stamp}, weekday={mem.weekday}, speaker_id={mem.speaker_id}, speaker_name={mem.speaker_name}, topic_id={mem.topic_id}, memory={mem.memory}")
 
+        _t0 = _time.perf_counter()
         if self.config.update == "online":
             self.online_update(memory_entries)
         elif self.config.update == "offline":
             self.offline_update(memory_entries)
+        _t_db_insert = _time.perf_counter() - _t0
+
+        # Accumulate stage timings (thread-safe)
+        with self._token_stats_lock:
+            self.token_stats["stage_compress_time"] += _t_compress
+            self.token_stats["stage_segment_time"] += _t_segment
+            self.token_stats["stage_llm_extract_time"] += _t_llm_extract
+            self.token_stats["stage_db_insert_time"] += _t_db_insert
         
         self.logger.info(
             f"[{call_id}] Cumulative token stats - "
             f"Total API calls: {self.token_stats['add_memory_calls']}, "
             f"Total tokens: {self.token_stats['add_memory_total_tokens']}"
+        )
+        self.logger.debug(
+            f"[{call_id}] Stage timings: compress={_t_compress:.3f}s, "
+            f"segment={_t_segment:.3f}s, llm_extract={_t_llm_extract:.3f}s, "
+            f"db_insert={_t_db_insert:.3f}s"
         )
         return result
 
@@ -552,7 +587,8 @@ class LightMemory:
             "calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            "total_tokens": 0
+            "total_tokens": 0,
+            "total_time": 0.0
         }
         token_lock = threading.Lock()
         def update_entry(entry):
@@ -588,6 +624,7 @@ class LightMemory:
                 update_token_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
                 update_token_stats["completion_tokens"] += usage.get("completion_tokens", 0)
                 update_token_stats["total_tokens"] += usage.get("total_tokens", 0)
+                update_token_stats["total_time"] += usage.get("time_taken", 0.0)
                 
             self.logger.debug(
                 f"[{call_id}] Update LLM call for {eid} - "
@@ -618,6 +655,7 @@ class LightMemory:
             self.token_stats["update_prompt_tokens"] += update_token_stats["prompt_tokens"]
             self.token_stats["update_completion_tokens"] += update_token_stats["completion_tokens"]
             self.token_stats["update_total_tokens"] += update_token_stats["total_tokens"]    
+            self.token_stats["update_time"] = self.token_stats.get("update_time", 0.0) + update_token_stats["total_time"]
         self.logger.info(f"[{call_id}] Offline update completed:")
         self.logger.info(f"[{call_id}]   - Processed: {processed_count} entries")
         self.logger.info(f"[{call_id}]   - Updated: {updated_count} entries")
@@ -672,7 +710,7 @@ class LightMemory:
         return result_string
 
     def get_token_statistics(self):
-        embedder_stats = {"total_calls": 0, "total_tokens": None}
+        embedder_stats = {"total_calls": 0, "total_tokens": None, "total_time": 0.0}
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'get_stats'):
             embedder_stats = self.text_embedder.get_stats()
         
@@ -680,8 +718,10 @@ class LightMemory:
             "summary": {
                 "total_llm_calls": self.token_stats["add_memory_calls"] + self.token_stats["update_calls"] + self.token_stats["summarize_calls"],
                 "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
+                "total_llm_time": self.token_stats.get("add_memory_time", 0.0) + self.token_stats.get("update_time", 0.0) + self.token_stats.get("summarize_time", 0.0),
                 "total_embedding_calls": embedder_stats["total_calls"],
                 "total_embedding_tokens": embedder_stats["total_tokens"],
+                "total_embedding_time": embedder_stats.get("total_time", 0.0),
             },
             "llm": {
                 "add_memory": {
@@ -707,6 +747,12 @@ class LightMemory:
                 "total_calls": embedder_stats["total_calls"],
                 "total_tokens": embedder_stats["total_tokens"],
                 "note": "Includes topic segmentation + memory indexing. Local models show None for tokens."
+            },
+            "stage_timings": {
+                "compress": self.token_stats.get("stage_compress_time", 0.0),
+                "segment": self.token_stats.get("stage_segment_time", 0.0),
+                "llm_extract": self.token_stats.get("stage_llm_extract_time", 0.0),
+                "db_insert": self.token_stats.get("stage_db_insert_time", 0.0),
             }
         }
         

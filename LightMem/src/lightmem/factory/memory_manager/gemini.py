@@ -1,6 +1,7 @@
 import concurrent.futures
 import json
 import os
+import time
 from typing import Dict, List, Optional, Literal, Any, Union
 
 try:
@@ -149,14 +150,16 @@ class GeminiManager:
         gemini_config = types.GenerateContentConfig(**{k: v for k, v in config_kwargs.items() if v is not None})
 
         try:
+            start_time = time.perf_counter()
             completion = self.client.models.generate_content(
                 model=self.config.model,
                 contents=gemini_contents,
                 config=gemini_config,
             )
+            time_taken = time.perf_counter() - start_time
         except Exception as e:
             print(f"Error calling Gemini API: {e}")
-            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
 
         response = self._parse_response(completion, tools)
         usage_md = completion.usage_metadata
@@ -166,9 +169,10 @@ class GeminiManager:
                 "prompt_tokens": getattr(usage_md, "prompt_token_count", 0),
                 "completion_tokens": getattr(usage_md, "candidates_token_count", 0),
                 "total_tokens": getattr(usage_md, "total_token_count", 0),
+                "time_taken": time_taken,
             }
         else:
-            usage_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            usage_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": time_taken}
 
         return response, usage_info
 
