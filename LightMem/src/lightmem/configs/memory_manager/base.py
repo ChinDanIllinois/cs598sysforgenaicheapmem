@@ -14,6 +14,7 @@ class MemoryManagerConfig(BaseModel):
         "vllm",
         "vllm_offline",
         "gemini",
+        "mock",
     ]
 
     configs: Optional[dict] = Field(description="Configuration for the specific MemoryManager model", default={})

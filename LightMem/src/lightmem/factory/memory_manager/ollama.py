@@ -88,25 +88,29 @@ class OllamaManager:
             "stop": self.config.stop,
         }
         
-        start_time = time.perf_counter()
-        completion = self.client.chat(
-            model=self.config.model,
-            messages=messages,
-            format=response_format,
-            tools=tools,
-            think=think,
-            options={
-                "num_gpu": self.config.num_gpu,
-                "main_gpu": self.config.main_gpu,
-                "num_ctx": params["max_tokens"],
-                "seed": params["seed"],
-                "temperature": params["temperature"],
-                "top_k": params["top_k"],
-                "top_p": params["top_p"],
-                "stop": params["stop"],
-            }
-        )
-        time_taken = time.perf_counter() - start_time
+        try:
+            start_time = time.perf_counter()
+            completion = self.client.chat(
+                model=self.config.model,
+                messages=messages,
+                format=response_format,
+                tools=tools,
+                think=think,
+                options={
+                    "num_gpu": self.config.num_gpu,
+                    "main_gpu": self.config.main_gpu,
+                    "num_ctx": params["max_tokens"],
+                    "seed": params["seed"],
+                    "temperature": params["temperature"],
+                    "top_k": params["top_k"],
+                    "top_p": params["top_p"],
+                    "stop": params["stop"],
+                }
+            )
+            time_taken = time.perf_counter() - start_time
+        except Exception as e:
+            print(f"Error calling Ollama API: {e}")
+            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
 
         response = self._parse_response(completion, tools)
         usage_info = {
@@ -205,7 +209,7 @@ class OllamaManager:
                     "input_prompt": [],
                     "output_prompt": "",
                     "cleaned_result": [],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
                 }
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

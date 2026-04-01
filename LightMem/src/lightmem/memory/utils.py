@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import threading
 from datetime import datetime
 from typing import List, Dict, Literal, Optional, Any, Tuple, Union
 import tiktoken
@@ -374,26 +375,54 @@ def process_extraction_results(
     token_stats: Dict[str, int],
     result_dict: Dict[str, Any],
     call_id: str,
-    logger = None
+    logger = None,
+    lock: Optional[threading.Lock] = None
 ) -> None:
     for idx, item in enumerate(extracted_results):
         if item is None:
+            if lock:
+                with lock:
+                    token_stats["add_memory_errors"] += 1
+            else:
+                token_stats["add_memory_errors"] += 1
+            if logger:
+                logger.warning(f"[{call_id}] API Call {idx} returned None (failed without exception).")
             continue
         if "usage" in item:
             usage = item["usage"]
-            token_stats["add_memory_calls"] += 1
-            token_stats["add_memory_prompt_tokens"] += usage.get("prompt_tokens", 0)
-            token_stats["add_memory_completion_tokens"] += usage.get("completion_tokens", 0)
-            token_stats["add_memory_total_tokens"] += usage.get("total_tokens", 0)
-            token_stats["add_memory_time"] = token_stats.get("add_memory_time", 0.0) + usage.get("time_taken", 0.0)
-            logger.info(
-                f"[{call_id}] API Call {idx} tokens - "
-                f"Prompt: {usage.get('prompt_tokens', 0)}, "
-                f"Completion: {usage.get('completion_tokens', 0)}, "
-                f"Total: {usage.get('total_tokens', 0)}"
-            )
-        logger.debug(f"[{call_id}] API Call {idx} raw output: {item.get('output_prompt', 'N/A')}")
-        logger.debug(f"[{call_id}] API Call {idx} cleaned result: {item.get('cleaned_result', [])}")
+            time_taken = usage.get("time_taken", 0.0)
+            if time_taken > 0:
+                if lock:
+                    with lock:
+                        token_stats["add_memory_calls"] += 1
+                        token_stats["add_memory_prompt_tokens"] += usage.get("prompt_tokens", 0)
+                        token_stats["add_memory_completion_tokens"] += usage.get("completion_tokens", 0)
+                        token_stats["add_memory_total_tokens"] += usage.get("total_tokens", 0)
+                        token_stats["add_memory_time"] = token_stats.get("add_memory_time", 0.0) + time_taken
+                else:
+                    token_stats["add_memory_calls"] += 1
+                    token_stats["add_memory_prompt_tokens"] += usage.get("prompt_tokens", 0)
+                    token_stats["add_memory_completion_tokens"] += usage.get("completion_tokens", 0)
+                    token_stats["add_memory_total_tokens"] += usage.get("total_tokens", 0)
+                    token_stats["add_memory_time"] = token_stats.get("add_memory_time", 0.0) + time_taken
+                
+                if logger:
+                    logger.info(
+                        f"[{call_id}] API Call {idx} tokens - "
+                        f"Prompt: {usage.get('prompt_tokens', 0)}, "
+                        f"Completion: {usage.get('completion_tokens', 0)}, "
+                        f"Total: {usage.get('total_tokens', 0)}"
+                    )
+            elif logger:
+                if lock:
+                    with lock:
+                        token_stats["add_memory_errors"] += 1
+                else:
+                    token_stats["add_memory_errors"] += 1
+                logger.warning(f"[{call_id}] API Call {idx} failed or returned 0 latency, skipping metrics update.")
+            if logger:
+                logger.debug(f"[{call_id}] API Call {idx} raw output: {item.get('output_prompt', 'N/A')}")
+                logger.debug(f"[{call_id}] API Call {idx} cleaned result: {item.get('cleaned_result', [])}")
         
         result_dict["add_input_prompt"].append(item.get("input_prompt", []))
         result_dict["add_output_prompt"].append(item.get("output_prompt", ""))
@@ -497,10 +526,12 @@ def call_summary_llm(
     speakers: List[str],
     custom_prompt: Optional[str] = None,  
     token_stats: Dict[str, int] = None,
-    logger = None
+    logger = None,
+    lock: Optional[threading.Lock] = None
 ) -> str:
     from lightmem.memory.prompts import LoCoMo_Cross_Event_Consolidation
-    logger.debug("Calling LLM for summary generation")
+    if logger:
+        logger.debug("Calling LLM for summary generation")
     speakers_str = ", ".join(sorted(speakers))
     prompt_template = custom_prompt if custom_prompt else LoCoMo_Cross_Event_Consolidation
     
@@ -528,11 +559,28 @@ def call_summary_llm(
     ]
     response, usage_info = manager.generate_response(messages)
     if token_stats is not None:
-        token_stats["summarize_calls"] += 1
-        token_stats["summarize_prompt_tokens"] += usage_info.get("prompt_tokens", 0)
-        token_stats["summarize_completion_tokens"] += usage_info.get("completion_tokens", 0)
-        token_stats["summarize_total_tokens"] += usage_info.get("total_tokens", 0)
-        token_stats["summarize_time"] = token_stats.get("summarize_time", 0.0) + usage_info.get("time_taken", 0.0)
+        time_taken = usage_info.get("time_taken", 0.0)
+        if time_taken > 0:
+            if lock:
+                with lock:
+                    token_stats["summarize_calls"] += 1
+                    token_stats["summarize_prompt_tokens"] += usage_info.get("prompt_tokens", 0)
+                    token_stats["summarize_completion_tokens"] += usage_info.get("completion_tokens", 0)
+                    token_stats["summarize_total_tokens"] += usage_info.get("total_tokens", 0)
+                    token_stats["summarize_time"] = token_stats.get("summarize_time", 0.0) + time_taken
+            else:
+                token_stats["summarize_calls"] += 1
+                token_stats["summarize_prompt_tokens"] += usage_info.get("prompt_tokens", 0)
+                token_stats["summarize_completion_tokens"] += usage_info.get("completion_tokens", 0)
+                token_stats["summarize_total_tokens"] += usage_info.get("total_tokens", 0)
+                token_stats["summarize_time"] = token_stats.get("summarize_time", 0.0) + time_taken
+        elif logger:
+            if lock:
+                with lock:
+                    token_stats["summarize_errors"] += 1
+            else:
+                token_stats["summarize_errors"] += 1
+            logger.warning("Summarization API call failed or returned 0 latency, skipping metrics update.")
     
     if logger:
         logger.debug(
