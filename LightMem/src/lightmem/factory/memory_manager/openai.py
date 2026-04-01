@@ -2,7 +2,7 @@ import concurrent
 from collections import defaultdict
 from openai import OpenAI
 from typing import List, Dict, Optional, Literal, Any
-import json, os, warnings
+import json, os, warnings, time
 import httpx
 from lightmem.memory.prompts import EXTRACTION_PROMPTS, METADATA_GENERATE_PROMPT
 from lightmem.configs.memory_manager.base_config import BaseMemoryManagerConfig
@@ -130,11 +130,19 @@ class OpenaiManager:
             params["tools"] = tools
             params["tool_choice"] = tool_choice
 
-        response = self.client.chat.completions.create(**params)
+        try:
+            start_time = time.perf_counter()
+            response = self.client.chat.completions.create(**params)
+            time_taken = time.perf_counter() - start_time
+        except Exception as e:
+            print(f"Error calling OpenAI API: {e}")
+            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
+            
         usage_info = {
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens,
+            "time_taken": time_taken,
         }
         parsed_response = self._parse_response(response, tools)
 
@@ -363,7 +371,7 @@ class OpenaiManager:
                     "input_prompt": [],
                     "output_prompt": "",
                     "cleaned_result": [],
-                    "usage": None,
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0},
                     "entry_type": entry_type
                 }
 

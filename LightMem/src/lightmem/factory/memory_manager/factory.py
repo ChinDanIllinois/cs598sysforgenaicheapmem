@@ -12,6 +12,7 @@ class MemoryManagerFactory:
         "vllm": "lightmem.factory.memory_manager.vllm.VllmManager",
         "vllm_offline": "lightmem.factory.memory_manager.vllm_offline.VllmOfflineManager",
         "gemini": "lightmem.factory.memory_manager.gemini.GeminiManager",
+        "mock": "lightmem.factory.memory_manager.mock.MockManager",
     }
 
     @classmethod

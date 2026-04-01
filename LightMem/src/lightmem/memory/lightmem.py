@@ -164,6 +164,9 @@ class LightMemory:
             "stage_segment_time": 0.0,
             "stage_llm_extract_time": 0.0,
             "stage_db_insert_time": 0.0,
+            "add_memory_errors": 0,
+            "update_errors": 0,
+            "summarize_errors": 0,
         }
         self._token_stats_lock = threading.Lock()
         self.logger.info("Token statistics tracking initialized")
@@ -361,13 +364,19 @@ class LightMemory:
         if self.config.metadata_generate and self.config.text_summary:
             self.logger.info(f"[{call_id}] Starting metadata generation")
             _t0 = _time.perf_counter()
-            extracted_results = self.manager.meta_text_extract(
-                extract_list=extract_list,
-                messages_use=self.config.messages_use,
-                topic_id_mapping=topic_id_mapping,
-                extraction_mode=self.config.extraction_mode,
-                custom_prompts=extract_prompts  
-            )
+            try:
+                extracted_results = self.manager.meta_text_extract(
+                    extract_list=extract_list,
+                    messages_use=self.config.messages_use,
+                    topic_id_mapping=topic_id_mapping,
+                    extraction_mode=self.config.extraction_mode,
+                    custom_prompts=extract_prompts  
+                )
+            except Exception as e:
+                with self._token_stats_lock:
+                    self.token_stats["add_memory_errors"] += 1
+                self.logger.error(f"[{call_id}] Extraction failed: {e}")
+                raise e
             _t_llm_extract = _time.perf_counter() - _t0
             # ============ API token Consumption ============
             process_extraction_results(
@@ -375,7 +384,8 @@ class LightMemory:
                 token_stats=self.token_stats,
                 result_dict=result,
                 call_id=call_id,
-                logger=self.logger
+                logger=self.logger,
+                lock=self._token_stats_lock
             )
             self.logger.info(f"[{call_id}] Metadata generation completed with {result['api_call_nums']} API calls")
 
@@ -581,14 +591,15 @@ class LightMemory:
         updated_count = 0
         deleted_count = 0
         skipped_count = 0
-        lock = threading.Lock()
+        lock = threading.Lock() # still needed for local counters below
         write_lock = threading.Lock()
         update_token_stats = {
             "calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
-            "total_time": 0.0
+            "total_time": 0.0,
+            "errors": 0
         }
         token_lock = threading.Lock()
         def update_entry(entry):
@@ -618,18 +629,28 @@ class LightMemory:
             if updated_entry is None:
                 return
             # ====== token consumption ======
-            usage = updated_entry["usage"]
-            with token_lock:
-                update_token_stats["calls"] += 1
-                update_token_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                update_token_stats["completion_tokens"] += usage.get("completion_tokens", 0)
-                update_token_stats["total_tokens"] += usage.get("total_tokens", 0)
-                update_token_stats["total_time"] += usage.get("time_taken", 0.0)
-                
-            self.logger.debug(
-                f"[{call_id}] Update LLM call for {eid} - "
-                f"Tokens: {usage.get('total_tokens', 0)}"
-            )
+            usage = updated_entry.get("usage")
+            if usage:
+                time_taken = usage.get("time_taken", 0.0)
+                if time_taken > 0:
+                    with token_lock:
+                        update_token_stats["calls"] += 1
+                        update_token_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                        update_token_stats["completion_tokens"] += usage.get("completion_tokens", 0)
+                        update_token_stats["total_tokens"] += usage.get("total_tokens", 0)
+                        update_token_stats["total_time"] += time_taken
+                    
+                    self.logger.debug(
+                        f"[{call_id}] Update LLM call for {eid} - "
+                        f"Tokens: {usage.get('total_tokens', 0)}"
+                    )
+                else:
+                    with token_lock:
+                        update_token_stats["errors"] += 1
+                    self.logger.warning(f"[{call_id}] Update LLM call for {eid} failed or returned 0 latency, skipping statistics.")
+            else:
+                with token_lock:
+                    update_token_stats["errors"] += 1
             # ==================== token consumption ====================
             action = updated_entry.get("action")
             if action == "delete":
@@ -651,16 +672,24 @@ class LightMemory:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             executor.map(update_entry, all_entries)
         with lock:
+            processed_count_final = processed_count
+            updated_count_final = updated_count
+            deleted_count_final = deleted_count
+            skipped_count_final = skipped_count
+
+        with self._token_stats_lock:
             self.token_stats["update_calls"] += update_token_stats["calls"]
             self.token_stats["update_prompt_tokens"] += update_token_stats["prompt_tokens"]
             self.token_stats["update_completion_tokens"] += update_token_stats["completion_tokens"]
             self.token_stats["update_total_tokens"] += update_token_stats["total_tokens"]    
             self.token_stats["update_time"] = self.token_stats.get("update_time", 0.0) + update_token_stats["total_time"]
+            self.token_stats["update_errors"] += update_token_stats["errors"]
+        
         self.logger.info(f"[{call_id}] Offline update completed:")
-        self.logger.info(f"[{call_id}]   - Processed: {processed_count} entries")
-        self.logger.info(f"[{call_id}]   - Updated: {updated_count} entries")
-        self.logger.info(f"[{call_id}]   - Deleted: {deleted_count} entries")
-        self.logger.info(f"[{call_id}]   - Skipped (no candidates): {skipped_count} entries")
+        self.logger.info(f"[{call_id}]   - Processed: {processed_count_final} entries")
+        self.logger.info(f"[{call_id}]   - Updated: {updated_count_final} entries")
+        self.logger.info(f"[{call_id}]   - Deleted: {deleted_count_final} entries")
+        self.logger.info(f"[{call_id}]   - Skipped (no candidates): {skipped_count_final} entries")
         self.logger.info(
             f"[{call_id}]   - Update API calls: {update_token_stats['calls']}, "
             f"Total tokens: {update_token_stats['total_tokens']}"
@@ -714,49 +743,83 @@ class LightMemory:
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'get_stats'):
             embedder_stats = self.text_embedder.get_stats()
         
-        stats = {
-            "summary": {
-                "total_llm_calls": self.token_stats["add_memory_calls"] + self.token_stats["update_calls"] + self.token_stats["summarize_calls"],
-                "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
-                "total_llm_time": self.token_stats.get("add_memory_time", 0.0) + self.token_stats.get("update_time", 0.0) + self.token_stats.get("summarize_time", 0.0),
-                "total_embedding_calls": embedder_stats["total_calls"],
-                "total_embedding_tokens": embedder_stats["total_tokens"],
-                "total_embedding_time": embedder_stats.get("total_time", 0.0),
-            },
-            "llm": {
-                "add_memory": {
-                    "calls": self.token_stats["add_memory_calls"],
-                    "prompt_tokens": self.token_stats["add_memory_prompt_tokens"],
-                    "completion_tokens": self.token_stats["add_memory_completion_tokens"],
-                    "total_tokens": self.token_stats["add_memory_total_tokens"],
+        with self._token_stats_lock:
+            stats = {
+                "summary": {
+                    "total_llm_calls": self.token_stats["add_memory_calls"] + self.token_stats["update_calls"] + self.token_stats["summarize_calls"],
+                    "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
+                    "total_llm_time": self.token_stats.get("add_memory_time", 0.0) + self.token_stats.get("update_time", 0.0) + self.token_stats.get("summarize_time", 0.0),
+                    "total_llm_errors": self.token_stats.get("add_memory_errors", 0) + self.token_stats.get("update_errors", 0) + self.token_stats.get("summarize_errors", 0),
+                    "total_embedding_calls": embedder_stats["total_calls"],
+                    "total_embedding_tokens": embedder_stats["total_tokens"],
+                    "total_embedding_time": embedder_stats.get("total_time", 0.0),
                 },
-                "update": {
-                    "calls": self.token_stats["update_calls"],
-                    "prompt_tokens": self.token_stats["update_prompt_tokens"],
-                    "completion_tokens": self.token_stats["update_completion_tokens"],
-                    "total_tokens": self.token_stats["update_total_tokens"],
+                "llm": {
+                    "add_memory": {
+                        "calls": self.token_stats["add_memory_calls"],
+                        "prompt_tokens": self.token_stats["add_memory_prompt_tokens"],
+                        "completion_tokens": self.token_stats["add_memory_completion_tokens"],
+                        "total_tokens": self.token_stats["add_memory_total_tokens"],
+                    },
+                    "update": {
+                        "calls": self.token_stats["update_calls"],
+                        "prompt_tokens": self.token_stats["update_prompt_tokens"],
+                        "completion_tokens": self.token_stats["update_completion_tokens"],
+                        "total_tokens": self.token_stats["update_total_tokens"],
+                    },
+                    "summarize": {
+                    "calls": self.token_stats["summarize_calls"],
+                    "prompt_tokens": self.token_stats["summarize_prompt_tokens"],
+                    "completion_tokens": self.token_stats["summarize_completion_tokens"],
+                    "total_tokens": self.token_stats["summarize_total_tokens"],
+                    },
                 },
-                "summarize": {
-                "calls": self.token_stats["summarize_calls"],
-                "prompt_tokens": self.token_stats["summarize_prompt_tokens"],
-                "completion_tokens": self.token_stats["summarize_completion_tokens"],
-                "total_tokens": self.token_stats["summarize_total_tokens"],
+                "embedding": {
+                    "total_calls": embedder_stats["total_calls"],
+                    "total_tokens": embedder_stats["total_tokens"],
+                    "note": "Includes topic segmentation + memory indexing. Local models show None for tokens."
                 },
-            },
-            "embedding": {
-                "total_calls": embedder_stats["total_calls"],
-                "total_tokens": embedder_stats["total_tokens"],
-                "note": "Includes topic segmentation + memory indexing. Local models show None for tokens."
-            },
-            "stage_timings": {
-                "compress": self.token_stats.get("stage_compress_time", 0.0),
-                "segment": self.token_stats.get("stage_segment_time", 0.0),
-                "llm_extract": self.token_stats.get("stage_llm_extract_time", 0.0),
-                "db_insert": self.token_stats.get("stage_db_insert_time", 0.0),
+                "stage_timings": {
+                    "compress": self.token_stats.get("stage_compress_time", 0.0),
+                    "segment": self.token_stats.get("stage_segment_time", 0.0),
+                    "llm_extract": self.token_stats.get("stage_llm_extract_time", 0.0),
+                    "db_insert": self.token_stats.get("stage_db_insert_time", 0.0),
+                }
             }
-        }
         
         return stats
+    
+    def reset_token_statistics(self):
+        with self._token_stats_lock:
+            self.token_stats = {
+                "add_memory_calls": 0,
+                "add_memory_prompt_tokens": 0,
+                "add_memory_completion_tokens": 0,
+                "add_memory_total_tokens": 0,
+                "add_memory_time": 0.0,
+                "update_calls": 0,
+                "update_prompt_tokens": 0,
+                "update_completion_tokens": 0,
+                "update_total_tokens": 0,
+                "update_time": 0.0,
+                "summarize_calls": 0,
+                "summarize_prompt_tokens": 0,
+                "summarize_completion_tokens": 0,
+                "summarize_total_tokens": 0,
+                "summarize_time": 0.0,
+                "embedding_calls": 0,
+                "embedding_total_tokens": 0,
+                "embedding_time": 0.0,
+                "stage_compress_time": 0.0,
+                "stage_segment_time": 0.0,
+                "stage_llm_extract_time": 0.0,
+                "stage_db_insert_time": 0.0,
+                "add_memory_errors": 0,
+                "update_errors": 0,
+                "summarize_errors": 0,
+            }
+        if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'reset_stats'):
+            self.text_embedder.reset_stats()
     
     def summarize(
         self,
@@ -853,7 +916,8 @@ class LightMemory:
                 speakers=speakers,
                 custom_prompt=SUMMARY_PROMPT,
                 token_stats=self.token_stats,
-                logger=self.logger
+                logger=self.logger,
+                lock=self._token_stats_lock
             )
             self.logger.debug(f"[{call_id}] Generated {len(summary_text)} chars")
             summary_id = store_summary(

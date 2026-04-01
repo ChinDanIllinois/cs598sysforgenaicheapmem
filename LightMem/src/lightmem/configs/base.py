@@ -10,7 +10,6 @@ from lightmem.configs.multimodal_embedder.base import MMEmbedderConfig
 from lightmem.configs.retriever.contextretriever.base import ContextRetrieverConfig
 from lightmem.configs.retriever.embeddingretriever.base import EmbeddingRetrieverConfig
 from lightmem.configs.logging.base import LoggingConfig
-
 lightmem_dir = ""
 
 class BaseMemoryConfigs(BaseModel):

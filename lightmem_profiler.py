@@ -36,6 +36,29 @@ from lightmem.memory.lightmem import LightMemory
 
 
 # ============================================================
+# UTILS — RATE LIMITING
+# ============================================================
+
+class AsyncRateLimiter:
+    """A simple token-bucket-like rate limiter for asyncio."""
+    def __init__(self, rpm: float):
+        self.rpm = rpm
+        self.interval = 60.0 / rpm if rpm > 0 else 0
+        self.last_call = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        if self.rpm <= 0:
+            return
+        async with self.lock:
+            now = time.perf_counter()
+            wait_time = self.last_call + self.interval - now
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            self.last_call = time.perf_counter()
+
+
+# ============================================================
 # CLI ARGUMENT PARSING
 # ============================================================
 
@@ -59,8 +82,15 @@ def parse_args():
     parser.add_argument(
         "--provider",
         required=True,
-        choices=["ollama", "gemini", "openai"],
+        choices=["ollama", "gemini", "openai", "mock"],
         help="LLM backend provider to use for memory management.",
+    )
+    parser.add_argument(
+        "--rpm",
+        type=float,
+        default=0,
+        metavar="RPM",
+        help="Rate limit in Requests Per Minute (default: 0 = unlimited).",
     )
     parser.add_argument(
         "--concurrency",
@@ -156,6 +186,7 @@ _PROVIDER_ENV_VARS = {
             "Obtain one at https://platform.openai.com/api-keys",
         ),
     ],
+    "mock": [],
 }
 
 
@@ -221,6 +252,7 @@ _MODEL_NAME_ENV = {
     "ollama": "OLLAMA_MODEL_NAME",
     "gemini": "GEMINI_MODEL_NAME",
     "openai": "OPENAI_MODEL_NAME",
+    "mock": "MOCK_MODEL_NAME"
 }
 _resolved_model_name = os.getenv(_MODEL_NAME_ENV[args.provider], "unknown")
 
@@ -231,7 +263,10 @@ CONFIG = {
     "concurrency_levels": args.concurrency,
     "test_seconds":       args.test_seconds,
     "dashboard_port":     args.port,
+    "rpm":                args.rpm,
 }
+
+rate_limiter = AsyncRateLimiter(CONFIG["rpm"])
 
 DATA_PATH            = os.getenv("DATA_PATH")
 LLMLINGUA_MODEL_PATH = os.getenv("LLMLINGUA_MODEL_PATH")
@@ -276,10 +311,20 @@ def _memory_manager_config_openai() -> dict:
     }
 
 
+def _memory_manager_config_mock() -> dict:
+    return {
+        "model_name": "mock",
+        "configs": {
+            "model": "mock-model",
+        },
+    }
+
+
 _MEMORY_MANAGER_BUILDERS = {
     "ollama": _memory_manager_config_ollama,
     "gemini": _memory_manager_config_gemini,
     "openai": _memory_manager_config_openai,
+    "mock":   _memory_manager_config_mock,
 }
 
 
@@ -415,32 +460,7 @@ def load_lightmem(collection_name: str) -> LightMemory:
 
 
 def reset_stats(mem):
-    mem.token_stats = {
-        "add_memory_calls":              0,
-        "add_memory_prompt_tokens":      0,
-        "add_memory_completion_tokens":  0,
-        "add_memory_total_tokens":       0,
-        "add_memory_time":               0.0,
-        "update_calls":                  0,
-        "update_prompt_tokens":          0,
-        "update_completion_tokens":      0,
-        "update_total_tokens":           0,
-        "update_time":                   0.0,
-        "embedding_calls":               0,
-        "embedding_total_tokens":        0,
-        "embedding_time":                0.0,
-        "summarize_calls":               0,
-        "summarize_prompt_tokens":       0,
-        "summarize_completion_tokens":   0,
-        "summarize_total_tokens":        0,
-        "summarize_time":                0.0,
-        "stage_compress_time":           0.0,
-        "stage_segment_time":            0.0,
-        "stage_llm_extract_time":        0.0,
-        "stage_db_insert_time":          0.0,
-    }
-    if hasattr(mem, "text_embedder") and hasattr(mem.text_embedder, "reset_stats"):
-        mem.text_embedder.reset_stats()
+    mem.reset_token_statistics()
 
 
 print(f"Initializing LightMem with provider: {CONFIG['provider']} ...")
@@ -462,6 +482,7 @@ live_throughput    = deque(maxlen=500)
 live_latency       = deque(maxlen=500)
 live_llm_rate      = deque(maxlen=500)
 live_embedding_rate = deque(maxlen=500)
+live_errors_per_sec = deque(maxlen=500)
 
 latency_samples: list[float] = []
 latency_samples_lock = threading.Lock()
@@ -488,6 +509,9 @@ async def worker(worker_id, stop_event):
         with metrics_lock:
             total_attempts += 1
         try:
+            # Respect RPM throttle
+            await rate_limiter.wait()
+
             await asyncio.to_thread(
                 memory.add_memory,
                 messages=messages,
@@ -533,6 +557,7 @@ async def run_single_concurrency(concurrency):
     live_latency.clear()
     live_llm_rate.clear()
     live_embedding_rate.clear()
+    live_errors_per_sec.clear()
 
     stop_event = asyncio.Event()
     workers    = [asyncio.create_task(worker(i, stop_event)) for i in range(concurrency)]
@@ -541,6 +566,7 @@ async def run_single_concurrency(concurrency):
     last_sample = start
     last_writes  = 0
     last_latency = 0.0
+    last_errors  = 0
 
     while time.perf_counter() - start < CONFIG["test_seconds"]:
         await asyncio.sleep(1)
@@ -552,11 +578,15 @@ async def run_single_concurrency(concurrency):
         with metrics_lock:
             writes_now  = total_writes
             latency_now = total_latency
+            errors_now  = total_errors
 
         delta_writes  = writes_now - last_writes
         delta_latency = latency_now - last_latency
+        delta_errors  = errors_now - last_errors
+        
         throughput      = delta_writes / interval
         avg_latency_sec = (delta_latency / delta_writes) if delta_writes > 0 else 0.0
+        errors_per_sec  = delta_errors / interval
 
         stats     = memory.get_token_statistics()
         llm_calls = stats.get("summary", {}).get("total_llm_calls", 0)
@@ -569,10 +599,12 @@ async def run_single_concurrency(concurrency):
         live_latency.append(avg_latency_sec)
         live_llm_rate.append(llm_rate)
         live_embedding_rate.append(embedding_rate)
+        live_errors_per_sec.append(errors_per_sec)
 
         last_sample  = now
         last_writes  = writes_now
         last_latency = latency_now
+        last_errors  = errors_now
 
     stop_event.set()
     await asyncio.gather(*workers)
@@ -699,6 +731,7 @@ _PROVIDER_LABEL = {
     "ollama": f"Ollama ({os.getenv('OLLAMA_MODEL_NAME', 'unknown')})",
     "gemini": f"Gemini ({os.getenv('GEMINI_MODEL_NAME', 'unknown')})",
     "openai": f"OpenAI ({os.getenv('OPENAI_MODEL_NAME', 'unknown')})",
+    "mock":   "Mock Provider (Simulated)",
 }
 
 app = Dash(__name__)
@@ -756,7 +789,8 @@ app.layout = html.Div([
             card_graph("live_latency"),
             card_graph("live_llm"),
             card_graph("live_embedding"),
-        ], ncols=2),
+            card_graph("live_errors"),
+        ], ncols=3),
 
         section("Sweep — Throughput, Latency & Errors", [
             card_graph("sweep_throughput"),
@@ -792,6 +826,7 @@ app.layout = html.Div([
         Output("live_latency",              "figure"),
         Output("live_llm",                  "figure"),
         Output("live_embedding",            "figure"),
+        Output("live_errors",               "figure"),
         Output("sweep_throughput",          "figure"),
         Output("sweep_latency_percentiles", "figure"),
         Output("sweep_error_rate",          "figure"),
@@ -823,6 +858,7 @@ def update_dashboard(n):
     fig_ll = live_fig(live_latency,       ACCENT2, "Avg E2E Latency  ·  live",                "seconds")
     fig_lr = live_fig(live_llm_rate,      ACCENT3, "LLM Calls/sec  ·  live",                  "calls/sec")
     fig_le = live_fig(live_embedding_rate, ACCENT4, "Embedding Calls/sec  ·  live",            "calls/sec")
+    fig_lerr = live_fig(live_errors_per_sec, ACCENT_ERR, "Errors/sec  ·  live",               "errors/sec")
 
     # ── Sweep: Throughput ────────────────────────────────────
     fig_st = go.Figure()
@@ -949,7 +985,7 @@ def update_dashboard(n):
         btn_style = {"display": "none"}
 
     return (
-        fig_lt, fig_ll, fig_lr, fig_le,
+        fig_lt, fig_ll, fig_lr, fig_le, fig_lerr,
         fig_st, fig_slp, fig_ser,
         fig_sl, fig_se,
         fig_alt, fig_aet,
