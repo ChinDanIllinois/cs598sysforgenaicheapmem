@@ -5,20 +5,14 @@ import time
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-import dotenv
-dotenv.load_dotenv()
-
 from lightmem.memory.lightmem import LightMemory
 
 
 # =========== Ollama Configuration ============
-your_ollama_model_name = "gemma3:12b-cloud"  # such as "llama3:latest"
-your_ollama_JUDGE_model_name = "gemma3:12b-cloud"  # such as "gemma3:latest"
-your_ollama_host = "http://localhost:11434"  # default Ollama host is "http://localhost:11434"
+your_ollama_model_name      = "phi"            # or whatever Phi release you pulled
+your_ollama_JUDGE_model_name= "phi"            # judge can be same or different
+your_ollama_host            = "http://localhost:11434"
+
 your_ollama_options_stable = {
     "num_ctx": 8192,  # set according to the model's context window
     "seed": 42,
@@ -29,13 +23,40 @@ your_ollama_options_stable = {
 }  # a stable settings of options for evaluation
 
 # ============ Small Model Paths ============
-LLMLINGUA_MODEL_PATH=os.getenv("LLMLINGUA_MODEL_PATH")
-EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH")
-
+LLMLINGUA_MODEL_PATH = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
+EMBEDDING_MODEL_PATH = "sentence-transformers/all-MiniLM-L6-v2"
 # ============ Data Configuration ============
-DATA_PATH=os.getenv("DATA_PATH")
-QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR")
+DATA_PATH='/Users/ambikasharan/Desktop/lightmem/LightMem/experiments/longmemeval/longmemeval_s.json'
+QDRANT_DATA_DIR='../qdrant_data'
 
+# make sure dataset exists; try to download from HuggingFace if missing
+if not os.path.isfile(DATA_PATH):
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise ImportError(
+            "huggingface_hub is not installed. Install with `pip install huggingface_hub` "
+            "or provide the dataset manually at DATA_PATH."
+        )
+
+    print(f"Dataset not found at {DATA_PATH}, downloading from Hugging Face Hub...")
+    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+
+    # choose the exact split file you want
+    downloaded_file = hf_hub_download(
+        repo_id="xiaowu0162/longmemeval-cleaned",
+        repo_type="dataset",
+        filename="longmemeval_s_cleaned.json",   # or longmemeval_m_cleaned.json
+        local_dir=os.path.dirname(DATA_PATH),
+        local_dir_use_symlinks=False,
+    )
+
+    # optional: copy/rename to your DATA_PATH
+    if downloaded_file != DATA_PATH:
+        import shutil
+        shutil.copyfile(downloaded_file, DATA_PATH)
+
+    print(f"Downloaded dataset to {DATA_PATH}")
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     if not abstention:
@@ -213,12 +234,11 @@ def main():
     }
 
     for item in tqdm(data):
-        item["question"] = "What fitness goal am I working towards?"
-        print(item["question"])
+        print(item["question_id"])
         lightmem = load_lightmem(collection_name=item["question_id"])
         sessions = item["haystack_sessions"][:10]
-        timestamps = item["haystack_dates"][:10]
-
+        timestamps = item["haystack_dates"]
+# )t;
         results_list = []
 
         time_start = time.time()
