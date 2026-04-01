@@ -21,6 +21,7 @@ from lightmem.memory.lightmem import LightMemory
 
 # =========== Gemini Configuration ============
 your_gemini_model_name = os.getenv("GEMINI_MODEL_NAME")
+print(f"Using {your_gemini_model_name} for LightMem")
 your_gemini_JUDGE_model_name = os.getenv("GEMINI_JUDGE_MODEL_NAME")
 your_gemini_options_stable = {
     "num_ctx": 8192,
@@ -140,9 +141,12 @@ def load_lightmem(collection_name):
             "log_filename_prefix": "run",
             "console_enabled": True,
             "file_level": "DEBUG",
-        }
+        },
+        "llm_batch_size": 3,
+        "llm_batch_timeout": 10,
     }
     lightmem = LightMemory.from_config(config)
+    print(f"Lightmem inititialized with model {lightmem.memory_manager.llm.name}")
     return lightmem
 
 

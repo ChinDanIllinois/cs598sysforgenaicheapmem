@@ -180,6 +180,11 @@ class LightMemory:
             self.segmenter = TopicSegmenterFactory.from_config(self.config.topic_segmenter, self.config.precomp_topic_shared, self.compressor)
             self.senmem_buffer_manager = SenMemBufferManager(max_tokens=self.segmenter.buffer_len, tokenizer=self.segmenter.tokenizer)
         self.logger.info("Initializing memory manager")
+        if hasattr(self.config, 'llm_batch_size'):
+            self.config.memory_manager.configs.llm_batch_size = self.config.llm_batch_size
+        if hasattr(self.config, 'llm_batch_timeout'):
+            self.config.memory_manager.configs.llm_batch_timeout = self.config.llm_batch_timeout
+            
         self.manager = MemoryManagerFactory.from_config(self.config.memory_manager)
         self.shortmem_buffer_manager = ShortMemBufferManager(max_tokens = 512, tokenizer=getattr(self.manager, "tokenizer", self.manager.config.model))
         if self.config.index_strategy == 'embedding' or self.config.index_strategy == 'hybrid':
@@ -387,6 +392,14 @@ class LightMemory:
                 logger=self.logger,
                 lock=self._token_stats_lock
             )
+            
+            # If any extraction failed (returned None), treat as a fatal error for this add_memory call
+            if any(res is None for res in extracted_results):
+                raise RuntimeError(
+                    f"[{call_id}] Metadata extraction failed for one or more segments. "
+                    "Check logs for details."
+                )
+
             self.logger.info(f"[{call_id}] Metadata generation completed with {result['api_call_nums']} API calls")
 
         memory_entries = convert_extraction_results_to_memory_entries(

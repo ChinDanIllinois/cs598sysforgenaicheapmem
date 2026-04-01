@@ -9,7 +9,9 @@ from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
 
-class GeminiBatchProcessor:
+from lightmem.factory.memory_manager.batch_manager import BatchManager
+
+class GeminiBatchManager(BatchManager):
     def __init__(self, client: genai.Client, model: str, batch_size: int, timeout: int, poll_interval: int, api_key: str, logger: Any):
         self.client = client
         self.model = model
@@ -28,8 +30,9 @@ class GeminiBatchProcessor:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
-    def add_request(self, messages: List[Dict[str, str]], config: Dict[str, Any]) -> concurrent.futures.Future:
+    def add_request(self, messages: List[Dict[str, str]], config: Optional[Dict[str, Any]] = None) -> concurrent.futures.Future:
         future = concurrent.futures.Future()
+        config = config or {}
         
         # Convert messages to Gemini format for the Batch API
         gemini_contents = []
@@ -50,7 +53,6 @@ class GeminiBatchProcessor:
         }
         
         # Merge config into the request structure
-        # Note: In Batch API, config is often passed per request in the JSONL
         generation_config = {
             "temperature": config.get("temperature"),
             "max_output_tokens": config.get("max_output_tokens"),
@@ -110,13 +112,16 @@ class GeminiBatchProcessor:
                     f.write(json.dumps(req) + "\n")
             
             self.logger.info(f"Uploading batch file: {filepath}")
-            # Gemini Developer API file upload
+            # Gemini Developer API file upload (This is the File API part)
             uploaded_file = self.client.files.upload(
-                path=filepath,
-                config=types.UploadFileConfig(display_name=f"lightmem_batch_{batch_id}")
+                file=filepath,
+                config=types.UploadFileConfig(
+                    display_name=f"lightmem_batch_{batch_id}",
+                    mime_type="application/jsonl"
+                )
             )
             
-            # Wait for file to be ACTIVE (though JSONL might be quick)
+            # Wait for file to be ACTIVE
             while True:
                 f_meta = self.client.files.get(name=uploaded_file.name)
                 if f_meta.state.name == "ACTIVE":
@@ -137,7 +142,7 @@ class GeminiBatchProcessor:
             # Poll for completion
             while True:
                 job_status = self.client.batches.get(name=job_name)
-                state = job_status.state.name # JOB_STATE_SUCCEEDED etc
+                state = job_status.state.name
                 self.logger.debug(f"Batch job {job_name} state: {state}")
                 
                 if state == "SUCCEEDED":
@@ -167,12 +172,10 @@ class GeminiBatchProcessor:
 
     def _handle_success(self, job_status, futures: List[concurrent.futures.Future]):
         try:
-            # output_file is the name of the file containing results
             output_file_name = job_status.output_file
             if not output_file_name:
                 raise Exception("Batch job succeeded but no output_file found.")
 
-            # Download the result file
             file_meta = self.client.files.get(name=output_file_name)
             download_url = file_meta.uri
             
@@ -191,17 +194,11 @@ class GeminiBatchProcessor:
                     break
                 try:
                     res_json = json.loads(line)
-                    # The result JSON contains the response from the model
-                    # Usually: {"response": {...}, "status": {...}}
-                    # We want to extract the same format as generate_response returns: (text, usage)
-                    
                     response_obj = res_json.get("response")
                     if not response_obj:
                         futures[i].set_exception(Exception(f"No response in result line {i}: {line}"))
                         continue
 
-                    # Extract text and usage similar to GeminiManager._parse_response
-                    # Note: We need to recreate the usage info
                     usage_md = response_obj.get("usageMetadata", {})
                     usage_info = {
                         "prompt_tokens": usage_md.get("promptTokenCount", 0),
@@ -209,7 +206,6 @@ class GeminiBatchProcessor:
                         "total_tokens": usage_md.get("totalTokenCount", 0),
                     }
                     
-                    # Gemini response can have multiple candidates
                     candidates = response_obj.get("candidates", [])
                     if candidates:
                         content = candidates[0].get("content", {})

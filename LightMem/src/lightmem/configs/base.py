@@ -120,4 +120,12 @@ class BaseMemoryConfigs(BaseModel):
                     "- 'flat': Extract factual entries only (independent units)\n"
                     "- 'event': Extract event-level structure (factual + relational, temporally bound)"
     )
+    llm_batch_size: Optional[int] = Field(
+        default=1,
+        description="Batch size for LLM inference calls. If > 1, batching is enabled."
+    )
+    llm_batch_timeout: Optional[int] = Field(
+        default=15,
+        description="Timeout in seconds for LLM batching. If batch size is not reached, batch is sent after this timeout."
+    )
 

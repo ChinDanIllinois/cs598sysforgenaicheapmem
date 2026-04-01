@@ -130,13 +130,9 @@ class OpenaiManager:
             params["tools"] = tools
             params["tool_choice"] = tool_choice
 
-        try:
-            start_time = time.perf_counter()
-            response = self.client.chat.completions.create(**params)
-            time_taken = time.perf_counter() - start_time
-        except Exception as e:
-            print(f"Error calling OpenAI API: {e}")
-            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
+        start_time = time.perf_counter()
+        response = self.client.chat.completions.create(**params)
+        time_taken = time.perf_counter() - start_time
             
         usage_info = {
             "prompt_tokens": response.usage.prompt_tokens,
@@ -324,63 +320,50 @@ class OpenaiManager:
 
         def process_segment_wrapper(args):
             api_call_idx, api_call_segments = args
-            try:
-                user_prompt_parts: List[str] = []
-                
-                global_topic_ids: List[int] = []
-                if topic_id_mapping and api_call_idx < len(topic_id_mapping):
-                    global_topic_ids = topic_id_mapping[api_call_idx]
+            user_prompt_parts: List[str] = []
+            
+            global_topic_ids: List[int] = []
+            if topic_id_mapping and api_call_idx < len(topic_id_mapping):
+                global_topic_ids = topic_id_mapping[api_call_idx]
 
-                for topic_idx, topic_segment in enumerate(api_call_segments):
-                    if topic_idx < len(global_topic_ids):
-                        global_topic_id = global_topic_ids[topic_idx]
-                    else:
-                        global_topic_id = topic_idx + 1
-                    
-                    topic_text = concatenate_messages(topic_segment, messages_use)
-                    user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
+            for topic_idx, topic_segment in enumerate(api_call_segments):
+                if topic_idx < len(global_topic_ids):
+                    global_topic_id = global_topic_ids[topic_idx]
+                else:
+                    global_topic_id = topic_idx + 1
+                
+                topic_text = concatenate_messages(topic_segment, messages_use)
+                user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
 
-                print(f"User prompt for API call {api_call_idx}:\n" + "\n".join(user_prompt_parts))
-                user_prompt = "\n".join(user_prompt_parts)
-                
-                metadata_messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
-                
-                raw_response, usage_info = self.generate_response(
-                    messages=metadata_messages,
-                    response_format={"type": "json_object"},
-                )
-                metadata_facts = clean_response(raw_response)
-                
-                for entry in metadata_facts:
-                    entry["entry_type"] = entry_type
+            print(f"User prompt for API call {api_call_idx}:\n" + "\n".join(user_prompt_parts))
+            user_prompt = "\n".join(user_prompt_parts)
+            
+            # Check for thinking level support if needed (similar to Gemini/Ollama)
+            # OpenAI doesn't use the 'think' param in the same way, but generate_response handles its own params
+            metadata_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            
+            raw_response, usage_info = self.generate_response(
+                messages=metadata_messages,
+                response_format={"type": "json_object"},
+            )
+            metadata_facts = clean_response(raw_response)
+            
+            for entry in metadata_facts:
+                entry["entry_type"] = entry_type
 
-                return {
-                    "input_prompt": metadata_messages,
-                    "output_prompt": raw_response,
-                    "cleaned_result": metadata_facts,
-                    "usage": usage_info,
-                    "entry_type": entry_type
-                }
-                
-            except Exception as e:
-                print(f"Error processing API call {api_call_idx}: {e}")
-                return {
-                    "input_prompt": [],
-                    "output_prompt": "",
-                    "cleaned_result": [],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0},
-                    "entry_type": entry_type
-                }
+            return {
+                "input_prompt": metadata_messages,
+                "output_prompt": raw_response,
+                "cleaned_result": metadata_facts,
+                "usage": usage_info,
+                "entry_type": entry_type
+            }
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            try:
-                results = list(executor.map(process_segment_wrapper, enumerate(extract_list)))
-            except Exception as e:
-                print(f"Error in parallel processing: {e}")
-                results = [None] * len(extract_list)
+            results = list(executor.map(process_segment_wrapper, enumerate(extract_list)))
 
         return results
 

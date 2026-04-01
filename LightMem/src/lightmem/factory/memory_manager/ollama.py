@@ -88,29 +88,25 @@ class OllamaManager:
             "stop": self.config.stop,
         }
         
-        try:
-            start_time = time.perf_counter()
-            completion = self.client.chat(
-                model=self.config.model,
-                messages=messages,
-                format=response_format,
-                tools=tools,
-                think=think,
-                options={
-                    "num_gpu": self.config.num_gpu,
-                    "main_gpu": self.config.main_gpu,
-                    "num_ctx": params["max_tokens"],
-                    "seed": params["seed"],
-                    "temperature": params["temperature"],
-                    "top_k": params["top_k"],
-                    "top_p": params["top_p"],
-                    "stop": params["stop"],
-                }
-            )
-            time_taken = time.perf_counter() - start_time
-        except Exception as e:
-            print(f"Error calling Ollama API: {e}")
-            return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
+        start_time = time.perf_counter()
+        completion = self.client.chat(
+            model=self.config.model,
+            messages=messages,
+            format=response_format,
+            tools=tools,
+            think=think,
+            options={
+                "num_gpu": self.config.num_gpu,
+                "main_gpu": self.config.main_gpu,
+                "num_ctx": params["max_tokens"],
+                "seed": params["seed"],
+                "temperature": params["temperature"],
+                "top_k": params["top_k"],
+                "top_p": params["top_p"],
+                "stop": params["stop"],
+            }
+        )
+        time_taken = time.perf_counter() - start_time
 
         response = self._parse_response(completion, tools)
         usage_info = {
@@ -179,44 +175,30 @@ class OllamaManager:
 
         def process_segment_wrapper(api_call_segments: List[List[Dict]]) -> Dict[str, Any]:
             """Process one API call (multiple topic segments inside)"""
-            try:
-                user_prompt_parts = []
-                for idx, topic_segment in enumerate(api_call_segments, start=1):
-                    topic_text = concatenate_messages(topic_segment, messages_use)
-                    user_prompt_parts.append(f"--- Topic {idx} ---\n{topic_text}")
+            user_prompt_parts = []
+            for idx, topic_segment in enumerate(api_call_segments, start=1):
+                topic_text = concatenate_messages(topic_segment, messages_use)
+                user_prompt_parts.append(f"--- Topic {idx} ---\n{topic_text}")
 
-                user_prompt = "\n".join(user_prompt_parts)
+            user_prompt = "\n".join(user_prompt_parts)
 
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-                raw_response, usage_info = self.generate_response(
-                    messages=messages,
-                    response_format="json"
-                )
-                cleaned_result = clean_response(raw_response)
-                return {
-                    "input_prompt": messages,
-                    "output_prompt": raw_response,
-                    "cleaned_result": cleaned_result,
-                    "usage": usage_info
-                }
-            except Exception as e:
-                print(f"Error processing API call: {e}")
-                # When error occurs, return empty but full structure
-                return {
-                    "input_prompt": [],
-                    "output_prompt": "",
-                    "cleaned_result": [],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0}
-                }
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            raw_response, usage_info = self.generate_response(
+                messages=messages,
+                response_format="json"
+            )
+            cleaned_result = clean_response(raw_response)
+            return {
+                "input_prompt": messages,
+                "output_prompt": raw_response,
+                "cleaned_result": cleaned_result,
+                "usage": usage_info
+            }
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            try:
-                results = list(executor.map(process_segment_wrapper, extract_list))
-            except Exception as e:
-                print(f"Error in parallel processing: {e}")
-                results = [None] * len(extract_list)
+            results = list(executor.map(process_segment_wrapper, extract_list))
 
         return results

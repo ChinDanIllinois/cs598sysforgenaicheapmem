@@ -13,6 +13,10 @@ except ImportError:
 from lightmem.configs.memory_manager.base_config import BaseMemoryManagerConfig
 from lightmem.memory.utils import clean_response
 from lightmem.memory.prompts import EXTRACTION_PROMPTS, METADATA_GENERATE_PROMPT
+from lightmem.factory.memory_manager.batch_processor import GeminiBatchManager
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiManager:
@@ -27,6 +31,18 @@ class GeminiManager:
             raise ValueError("Gemini API key is required. Pass api_key in config or set GEMINI_API_KEY env var.")
 
         self.client = genai.Client(api_key=api_key)
+        
+        self.batch_manager = None
+        if self.config.llm_batch_size > 1:
+            self.batch_manager = GeminiBatchManager(
+                client=self.client,
+                model=self.config.model,
+                batch_size=self.config.llm_batch_size,
+                timeout=self.config.llm_batch_timeout,
+                poll_interval=10, # default poll interval
+                api_key=api_key,
+                logger=logger
+            )
 
     def _parse_response(self, response, tools):
         """
@@ -244,19 +260,104 @@ class GeminiManager:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ]
-            raw_response, usage_info = self.generate_response(
+            
+            if self.batch_manager:
+                # Use batch manager
+                future = self.batch_manager.add_request(
+                    messages=messages,
+                    config={
+                        "temperature": self.config.temperature,
+                        "max_output_tokens": self.config.max_tokens,
+                        "top_p": self.config.top_p,
+                        "top_k": self.config.top_k,
+                        "response_mime_type": "application/json"
+                    }
+                )
+                return future
+            else:
+                raw_response, usage_info = self.generate_response(
+                    messages=messages,
+                    response_format="json"
+                )
+                cleaned_result = clean_response(raw_response)
+                return {
+                    "input_prompt": messages,
+                    "output_prompt": raw_response,
+                    "cleaned_result": cleaned_result,
+                    "usage": usage_info
+                }
+
+        if self.batch_manager:
+            # Collect futures and wait for them
+            futures = [process_segment_wrapper(segments) for segments in extract_list]
+            results = []
+            for i, future in enumerate(futures):
+                text, usage = future.result()
+                cleaned_result = clean_response(text)
+                results.append({
+                    "input_prompt": [], # Batch API doesn't easily return the original prompt here unless we track it
+                    "output_prompt": text,
+                    "cleaned_result": cleaned_result,
+                    "usage": usage
+                })
+            return results
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(process_segment_wrapper, extract_list))
+            return results
+
+    def _call_update_llm(self, system_prompt: str, target_entry: Dict, candidate_sources: List[Dict]):
+        """
+        Call LLM to decide whether to update, delete, or ignore a memory entry.
+        Used during offline updates.
+        """
+        target_memory = target_entry["payload"]["memory"]
+        candidate_memories = [c["payload"]["memory"] for c in candidate_sources]
+
+        user_prompt = (
+            f"Target memory:{target_memory}\n"
+            f"Candidate memories:\n" + "\n".join([f"- {m}" for m in candidate_memories])
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        if self.batch_manager:
+            future = self.batch_manager.add_request(
+                messages=messages,
+                config={
+                    "temperature": self.config.temperature,
+                    "max_output_tokens": self.config.max_tokens,
+                    "response_mime_type": "application/json"
+                }
+            )
+            try:
+                response_text, usage_info = future.result()
+                result = json.loads(response_text)
+                if "action" not in result:
+                    result = {"action": "ignore"}
+                result["usage"] = usage_info
+                return result
+            except Exception as e:
+                logger.error(f"Batch update LLM call failed: {e}")
+                return {"action": "ignore", "usage": None}
+        else:
+            response_text, usage_info = self.generate_response(
                 messages=messages,
                 response_format="json"
             )
-            cleaned_result = clean_response(raw_response)
-            return {
-                "input_prompt": messages,
-                "output_prompt": raw_response,
-                "cleaned_result": cleaned_result,
-                "usage": usage_info
-            }
+            try:
+                result = json.loads(response_text)
+                if "action" not in result:
+                    result = {"action": "ignore"}
+                result["usage"] = usage_info
+                return result
+            except Exception:
+                return {"action": "ignore", "usage": usage_info}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(process_segment_wrapper, extract_list))
-
-        return results
+    def stop(self):
+        """Stop the batch manager if it exists."""
+        if self.batch_manager:
+            self.batch_manager.stop()

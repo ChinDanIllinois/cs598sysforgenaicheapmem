@@ -124,6 +124,20 @@ def parse_args():
         help="Dashboard port (default: 8051).",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Batch size for LLM inference (Gemini only, default: 1).",
+    )
+    parser.add_argument(
+        "--batch-timeout",
+        type=int,
+        default=15,
+        metavar="SEC",
+        help="Batch timeout in seconds (Gemini only, default: 15).",
+    )
+    parser.add_argument(
         "--run-name",
         type=str,
         default="",
@@ -273,6 +287,8 @@ CONFIG = {
     "test_seconds":       args.test_seconds,
     "dashboard_port":     args.port,
     "rpm":                args.rpm,
+    "batch_size":         args.batch_size,
+    "batch_timeout":      args.batch_timeout,
 }
 
 rate_limiter = AsyncRateLimiter(CONFIG["rpm"])
@@ -464,6 +480,8 @@ def load_lightmem(collection_name: str) -> LightMemory:
             "console_enabled":      True,
             "file_level":           "DEBUG",
         },
+        "llm_batch_size": CONFIG["batch_size"],
+        "llm_batch_timeout": CONFIG["batch_timeout"],
     }
     return LightMemory.from_config(config)
 
