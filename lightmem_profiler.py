@@ -28,6 +28,15 @@ from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 
+import logging
+import flask.cli
+
+# Suppress Flask / Dash / Werkzeug banner and logs
+flask.cli.show_server_banner = lambda *args: None
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('flask').setLevel(logging.ERROR)
+logging.getLogger('dash').setLevel(logging.ERROR)
+
 import os
 import dotenv
 dotenv.load_dotenv()
@@ -338,7 +347,7 @@ def load_dataset(data_path: str):
     Load all (messages, timestamp) pairs from LongMemEval dataset.
     Returns a flat list of turn_messages lists ready for add_memory.
     """
-    with open(data_path, "r") as f:
+    with open(data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     samples = []
@@ -765,6 +774,7 @@ _PROVIDER_LABEL = {
 }
 
 app = Dash(__name__)
+app.logger.setLevel(logging.ERROR)
 app.title = f"LightMem Profiler — {CONFIG['provider'].capitalize()}"
 
 app.layout = html.Div([
