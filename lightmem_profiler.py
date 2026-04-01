@@ -304,8 +304,9 @@ def _memory_manager_config_openai() -> dict:
     return {
         "model_name": "openai",
         "configs": {
-            "model":      os.getenv("OPENAI_MODEL_NAME"),
-            "api_key":    os.getenv("OPENAI_API_KEY"),
+            "model": os.getenv("OPENAI_MODEL_NAME", "openrouter/free"),
+            "api_key": os.getenv("OPENAI_API_KEY"),
+            "openai_base_url": "https://openrouter.ai/api/v1",
             "max_tokens": 16384,
         },
     }
