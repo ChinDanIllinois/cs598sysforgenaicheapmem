@@ -146,7 +146,6 @@ def load_lightmem(collection_name):
         "llm_batch_timeout": 10,
     }
     lightmem = LightMemory.from_config(config)
-    print(f"Lightmem inititialized with model {lightmem.memory_manager.llm.name}")
     return lightmem
 
 
@@ -246,8 +245,8 @@ def main():
         item["question"] = "What fitness goal am I working towards?"
         print(item["question"])
         lightmem = load_lightmem(collection_name=item["question_id"])
-        sessions = item.get("haystack_sessions", [])[:10]
-        timestamps = item.get("haystack_dates", [])[:10]
+        sessions = item.get("haystack_sessions", [])[:1]
+        timestamps = item.get("haystack_dates", [])[:1]
 
         results_list = []
 
