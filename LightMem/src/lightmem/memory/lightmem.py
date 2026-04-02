@@ -411,6 +411,9 @@ class LightMemory:
         normalizer = MessageNormalizer(offset_ms=500)
         msgs = normalizer.normalize_messages(messages)
         
+        import time
+        t_start = time.perf_counter()
+        
         if self.config.pre_compress:
             if hasattr(self.compressor, "tokenizer") and self.compressor.tokenizer is not None:
                 args = (msgs, self.compressor.tokenizer)
@@ -418,10 +421,14 @@ class LightMemory:
                 args = (msgs, self.segmenter.tokenizer)
             else:
                 args = (msgs,)
-            compressed_messages = self.compressor.compress(*args)
+            loop = asyncio.get_event_loop()
+            compressed_messages = await loop.run_in_executor(None, lambda: self.compressor.compress(*args))
         else:
             compressed_messages = msgs
             self.logger.info(f"[{call_id}] Pre-compression disabled, using normalized messages")
+        
+        t_compress = time.perf_counter()
+        self.token_stats["stage_compress_time"] = self.token_stats.get("stage_compress_time", 0.0) + (t_compress - t_start)
         
         if not self.config.topic_segment:
             self.logger.info(f"[{call_id}] Topic segmentation disabled, returning emitted messages")
@@ -433,15 +440,20 @@ class LightMemory:
                 "carryover_size": 0,
             }
 
-        all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
+        loop = asyncio.get_event_loop()
+        all_segments = await loop.run_in_executor(None, lambda: self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder))
 
         if force_segment:
-            all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+            all_segments = await loop.run_in_executor(None, lambda: self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment))
+        
+        t_segment = time.perf_counter()
+        self.token_stats["stage_segment_time"] = self.token_stats.get("stage_segment_time", 0.0) + (t_segment - t_compress)
         
         if not all_segments:
             return result
 
-        extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
+        loop = asyncio.get_event_loop()
+        extract_trigger_num, extract_list = await loop.run_in_executor(None, lambda: self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract))
 
         if extract_trigger_num == 0:
             return result
@@ -458,6 +470,7 @@ class LightMemory:
         extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
         max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
         
+        t_extract_start = time.perf_counter()
         if self.config.metadata_generate and self.config.text_summary:
             self.logger.info(f"[{call_id}] Starting metadata generation")
             if hasattr(self.manager, "meta_text_extract_async"):
@@ -489,6 +502,10 @@ class LightMemory:
                 logger=self.logger
             )
             self.logger.info(f"[{call_id}] Metadata generation completed with {result['api_call_nums']} API calls")
+            
+        t_extract_end = time.perf_counter()
+        self.token_stats["stage_llm_extract_time"] = self.token_stats.get("stage_llm_extract_time", 0.0) + (t_extract_end - t_extract_start)
+        self.token_stats["total_llm_time"] = self.token_stats.get("total_llm_time", 0.0) + (t_extract_end - t_extract_start)
 
         memory_entries = convert_extraction_results_to_memory_entries(
             extracted_results=extracted_results,
@@ -500,10 +517,14 @@ class LightMemory:
             logger=self.logger
         )
 
+        t_db_start = time.perf_counter()
+        loop = asyncio.get_event_loop()
         if self.config.update == "online":
-            self.online_update(memory_entries)
+            await loop.run_in_executor(None, lambda: self.online_update(memory_entries))
         elif self.config.update == "offline":
-            self.offline_update(memory_entries)
+            await loop.run_in_executor(None, lambda: self.offline_update(memory_entries))
+        t_db_end = time.perf_counter()
+        self.token_stats["stage_db_insert_time"] = self.token_stats.get("stage_db_insert_time", 0.0) + (t_db_end - t_db_start)
         
         self.logger.info(
             f"[{call_id}] Cumulative token stats - "
@@ -800,6 +821,31 @@ class LightMemory:
         self.logger.info(f"========== END {call_id} ==========")
         return result_string
 
+    def reset_token_statistics(self):
+        self.token_stats = {
+            "add_memory_calls": 0,
+            "add_memory_prompt_tokens": 0,
+            "add_memory_completion_tokens": 0,
+            "add_memory_total_tokens": 0,
+            "update_calls": 0,
+            "update_prompt_tokens": 0,
+            "update_completion_tokens": 0,
+            "update_total_tokens": 0,
+            "summarize_calls": 0,
+            "summarize_prompt_tokens": 0,
+            "summarize_completion_tokens": 0,
+            "summarize_total_tokens": 0,
+            "embedding_calls": 0,
+            "embedding_total_tokens": 0,
+            "stage_compress_time": 0.0,
+            "stage_segment_time": 0.0,
+            "stage_llm_extract_time": 0.0,
+            "stage_db_insert_time": 0.0,
+            "total_llm_time": 0.0,
+        }
+        if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'reset_stats'):
+            self.text_embedder.reset_stats()
+
     def get_token_statistics(self):
         embedder_stats = {"total_calls": 0, "total_tokens": None}
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'get_stats'):
@@ -807,10 +853,18 @@ class LightMemory:
         
         stats = {
             "summary": {
-                "total_llm_calls": self.token_stats["add_memory_calls"] + self.token_stats["update_calls"] + self.token_stats["summarize_calls"],
-                "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
-                "total_embedding_calls": embedder_stats["total_calls"],
-                "total_embedding_tokens": embedder_stats["total_tokens"],
+                "total_llm_calls": self.token_stats.get("add_memory_calls", 0) + self.token_stats.get("update_calls", 0) + self.token_stats.get("summarize_calls", 0),
+                "total_llm_tokens": self.token_stats.get("add_memory_total_tokens", 0) + self.token_stats.get("update_total_tokens", 0) + self.token_stats.get("summarize_total_tokens", 0),
+                "total_llm_time": self.token_stats.get("total_llm_time", 0.0),
+                "total_embedding_calls": embedder_stats.get("total_calls", 0),
+                "total_embedding_tokens": embedder_stats.get("total_tokens", 0),
+                "total_embedding_time": self.token_stats.get("stage_segment_time", 0.0),
+            },
+            "stage_timings": {
+                "compress": self.token_stats.get("stage_compress_time", 0.0),
+                "segment": self.token_stats.get("stage_segment_time", 0.0),
+                "llm_extract": self.token_stats.get("stage_llm_extract_time", 0.0),
+                "db_insert": self.token_stats.get("stage_db_insert_time", 0.0),
             },
             "llm": {
                 "add_memory": {
