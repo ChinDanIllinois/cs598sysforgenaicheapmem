@@ -1,6 +1,8 @@
+import logging
 from typing import Dict, Optional
 from importlib import import_module
 from lightmem.configs.memory_manager.base import MemoryManagerConfig
+from .batch_processor import GeminiBatchProcessor, VllmBatchProcessor
 
 
 class MemoryManagerFactory:
@@ -44,10 +46,46 @@ class MemoryManagerFactory:
             module_path, class_name = class_path.rsplit('.', 1)
             module = import_module(module_path)
             manager_class = getattr(module, class_name)
-            if config.configs is None:
-                return manager_class()
-            else:
-                return manager_class(config=config.configs)
+            
+            manager_kwargs = {}
+            if config.configs is not None:
+                manager_kwargs["config"] = config.configs
+            
+            # Instantiate the manager
+            manager = manager_class(**manager_kwargs)
+            
+            # Setup batching if enabled
+            if config.configs and config.configs.llm_batch_size > 1:
+                logger = logging.getLogger("LightMem")
+                batch_manager = None
+                
+                if model_name == "vllm":
+                    batch_manager = VllmBatchProcessor(
+                        base_url=config.configs.vllm_base_url or "http://localhost:8000/v1",
+                        model=config.configs.model,
+                        batch_size=config.configs.llm_batch_size,
+                        timeout=config.configs.llm_batch_timeout,
+                        api_key=config.configs.api_key or "EMPTY",
+                        logger=logger
+                    )
+                elif model_name == "gemini":
+                    # Gemini needs the client from the manager
+                    if hasattr(manager, "client"):
+                        batch_manager = GeminiBatchProcessor(
+                            client=manager.client,
+                            model=config.configs.model,
+                            batch_size=config.configs.llm_batch_size,
+                            timeout=config.configs.llm_batch_timeout,
+                            poll_interval=5, # Default poll interval
+                            api_key=config.configs.api_key,
+                            logger=logger
+                        )
+                
+                if batch_manager:
+                    manager.batch_manager = batch_manager
+                    logger.info(f"Enabled batching for {model_name} with batch_size={config.configs.llm_batch_size}")
+
+            return manager
             
         except ImportError as e:
             raise ImportError(

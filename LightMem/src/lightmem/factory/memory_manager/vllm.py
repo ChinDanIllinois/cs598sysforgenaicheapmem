@@ -11,9 +11,13 @@ from lightmem.memory.utils import clean_response
 from lightmem.memory.prompts import EXTRACTION_PROMPTS, METADATA_GENERATE_PROMPT
 
 
+from .batch_manager import BatchManager
+
+
 class VllmManager:
-    def __init__(self, config: BaseMemoryManagerConfig):
+    def __init__(self, config: BaseMemoryManagerConfig, batch_manager: Optional[BatchManager] = None):
         self.config = config
+        self.batch_manager = batch_manager
 
         if not self.config.model:
             raise ValueError("vLLM model is not specified. Refer to https://vllm.ai/docs/models/ for available models.")
@@ -285,32 +289,75 @@ class VllmManager:
             
             return "\n".join(message_lines)
 
+        def get_metadata_messages(api_call_idx, api_call_segments):
+            user_prompt_parts: List[str] = []
+            
+            global_topic_ids: List[int] = []
+            if topic_id_mapping and api_call_idx < len(topic_id_mapping):
+                global_topic_ids = topic_id_mapping[api_call_idx]
+
+            for topic_idx, topic_segment in enumerate(api_call_segments):
+                if topic_idx < len(global_topic_ids):
+                    global_topic_id = global_topic_ids[topic_idx]
+                else:
+                    global_topic_id = topic_idx + 1
+                
+                topic_text = concatenate_messages(topic_segment, messages_use)
+                user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
+
+            user_prompt = "\n".join(user_prompt_parts)
+            
+            return [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+        if self.batch_manager:
+            futures = []
+            for idx, segments in enumerate(extract_list):
+                metadata_messages = get_metadata_messages(idx, segments)
+                # Batch processor expects (messages, config)
+                # We pass response_format in config
+                fut = self.batch_manager.add_request(
+                    messages=metadata_messages,
+                    config={"response_format": {"type": "json_object"}}
+                )
+                futures.append(fut)
+            
+            # Wait for all futures to complete
+            results = []
+            for idx, fut in enumerate(futures):
+                try:
+                    raw_response, usage_info = fut.result()
+                    metadata_facts = clean_response(raw_response)
+                    for entry in metadata_facts:
+                        entry["entry_type"] = entry_type
+                        
+                    results.append({
+                        "input_prompt": get_metadata_messages(idx, extract_list[idx]),
+                        "output_prompt": raw_response,
+                        "cleaned_result": metadata_facts,
+                        "usage": usage_info,
+                        "entry_type": entry_type
+                    })
+                except Exception as e:
+                    print(f"Error in batch result {idx}: {e}")
+                    results.append({
+                        "input_prompt": [],
+                        "output_prompt": "",
+                        "cleaned_result": [],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "time_taken": 0.0},
+                        "entry_type": entry_type
+                    })
+            return results
+
+        # Standard non-batch path
         max_workers = min(len(extract_list), 5)
 
         def process_segment_wrapper(args):
             api_call_idx, api_call_segments = args
             try:
-                user_prompt_parts: List[str] = []
-                
-                global_topic_ids: List[int] = []
-                if topic_id_mapping and api_call_idx < len(topic_id_mapping):
-                    global_topic_ids = topic_id_mapping[api_call_idx]
-
-                for topic_idx, topic_segment in enumerate(api_call_segments):
-                    if topic_idx < len(global_topic_ids):
-                        global_topic_id = global_topic_ids[topic_idx]
-                    else:
-                        global_topic_id = topic_idx + 1
-                    
-                    topic_text = concatenate_messages(topic_segment, messages_use)
-                    user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
-
-                user_prompt = "\n".join(user_prompt_parts)
-                
-                metadata_messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
+                metadata_messages = get_metadata_messages(api_call_idx, api_call_segments)
                 
                 # Check if model supports JSON response format. Some vLLM models might not.
                 # If it doesn't, it will just yield text which clean_response handles.
@@ -378,3 +425,8 @@ class VllmManager:
             return result
         except Exception:
             return {"action": "ignore", "usage": usage_info if 'usage_info' in locals() else None}
+
+    def stop(self):
+        """Stop the batch manager if it exists"""
+        if self.batch_manager:
+            self.batch_manager.stop()
