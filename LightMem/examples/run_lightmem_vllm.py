@@ -16,7 +16,7 @@ from lightmem.memory.lightmem import LightMemory
 
 # =========== vLLM Configuration ============
 # Default to localhost if not specified
-your_vllm_model_name = os.getenv("VLLM_MODEL_NAME", "facebook/opt-125m")
+your_vllm_model_name = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
 your_vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
 your_vllm_api_key = os.getenv("VLLM_API_KEY", "EMPTY")
 
