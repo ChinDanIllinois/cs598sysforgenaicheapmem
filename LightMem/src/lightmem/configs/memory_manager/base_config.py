@@ -32,6 +32,8 @@ class BaseMemoryManagerConfig:
         vllm_base_url: Optional[str] = None, # vLLM specific
         site_url: Optional[str] = None,
         app_name: Optional[str] = None,
+        llm_batch_size: int = 1,
+        llm_batch_timeout: int = 15,
     ):
 
         # General parameters
@@ -62,3 +64,5 @@ class BaseMemoryManagerConfig:
         self.vllm_base_url = vllm_base_url
         self.site_url = site_url
         self.app_name = app_name
+        self.llm_batch_size = llm_batch_size
+        self.llm_batch_timeout = llm_batch_timeout

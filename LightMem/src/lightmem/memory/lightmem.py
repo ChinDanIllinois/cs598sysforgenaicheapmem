@@ -821,6 +821,11 @@ class LightMemory:
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'reset_stats'):
             self.text_embedder.reset_stats()
     
+    def stop(self):
+        """Stop background threads (e.g. batching)"""
+        if hasattr(self.manager, "stop"):
+            self.manager.stop()
+    
     def summarize(
         self,
         SUMMARY_PROMPT: Optional[str] = None,

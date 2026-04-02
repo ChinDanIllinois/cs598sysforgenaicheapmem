@@ -8,8 +8,9 @@ import requests
 from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
+from .batch_manager import BatchManager
 
-class GeminiBatchProcessor:
+class GeminiBatchProcessor(BatchManager):
     def __init__(self, client: genai.Client, model: str, batch_size: int, timeout: int, poll_interval: int, api_key: str, logger: Any):
         self.client = client
         self.model = model
@@ -225,6 +226,141 @@ class GeminiBatchProcessor:
 
         except Exception as e:
             self.logger.error(f"Failed to handle batch success: {e}")
+            for f in futures:
+                if not f.done():
+                    f.set_exception(e)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._monitor_thread.is_alive():
+            self._monitor_thread.join()
+
+class VllmBatchProcessor(BatchManager):
+    def __init__(self, base_url: str, model: str, batch_size: int, timeout: int, api_key: str, logger: Any):
+        self.base_url = base_url.rstrip("/")
+        if not self.base_url.endswith("/v1"):
+            self.batch_url = f"{self.base_url}/v1/chat/completions/batch"
+        else:
+            self.batch_url = f"{self.base_url}/chat/completions/batch"
+            
+        self.model = model
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.api_key = api_key
+        self.logger = logger
+        
+        self._buffer: List[List[Dict[str, str]]] = []
+        self._configs: List[Dict[str, Any]] = []
+        self._futures: List[concurrent.futures.Future] = []
+        self._lock = threading.Lock()
+        self._last_flush_time = time.time()
+        
+        self._stop_event = threading.Event()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def add_request(self, messages: List[Dict[str, str]], config: Optional[Dict[str, Any]] = None) -> concurrent.futures.Future:
+        future = concurrent.futures.Future()
+        
+        with self._lock:
+            self._buffer.append(messages)
+            self._configs.append(config or {})
+            self._futures.append(future)
+            self.logger.debug(f"Added request to vLLM batch buffer. Current size: {len(self._buffer)}")
+            
+            if len(self._buffer) >= self.batch_size:
+                self.logger.info(f"Batch size {self.batch_size} reached. Flushing...")
+                self._flush()
+            elif len(self._buffer) == 1:
+                self._last_flush_time = time.time()
+        
+        return future
+
+    def _monitor_loop(self):
+        while not self._stop_event.is_set():
+            time.sleep(1)
+            with self._lock:
+                if self._buffer and (time.time() - self._last_flush_time >= self.timeout):
+                    self.logger.info(f"Batch timeout {self.timeout}s reached. Flushing {len(self._buffer)} requests...")
+                    self._flush()
+
+    def _flush(self):
+        if not self._buffer:
+            return
+            
+        requests_to_process = list(self._buffer)
+        configs_to_use = list(self._configs)
+        futures_to_resolve = list(self._futures)
+        
+        self._buffer = []
+        self._configs = []
+        self._futures = []
+        self._last_flush_time = time.time()
+        
+        threading.Thread(target=self._process_batch, args=(requests_to_process, configs_to_use, futures_to_resolve), daemon=True).start()
+
+    def _process_batch(self, messages_list: List[List[Dict]], configs: List[Dict], futures: List[concurrent.futures.Future]):
+        try:
+            # vLLM batch endpoint expects {"model": ..., "messages": [[msgs1], [msgs2], ...], "response_format": ...}
+            # We assume uniform response_format for the batch (common in LightMem meta_text_extract)
+            response_format = None
+            for cfg in configs:
+                if cfg.get("response_format"):
+                    response_format = cfg["response_format"]
+                    break
+            
+            payload = {
+                "model": self.model,
+                "messages": messages_list
+            }
+            if response_format:
+                payload["response_format"] = response_format
+
+            self.logger.info(f"Sending vLLM batch request with {len(messages_list)} conversations to {self.batch_url}")
+            start_time = time.perf_counter()
+            
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            response = requests.post(self.batch_url, json=payload, headers=headers, timeout=300)
+            response.raise_for_status()
+            
+            time_taken = time.perf_counter() - start_time
+            data = response.json()
+            
+            # vLLM returns choices where each choice represents a conversation result
+            # and choice["index"] corresponds to the order in messages_list
+            choices = data.get("choices", [])
+            
+            # Reconstruct usage - vLLM may provide total usage for the batch
+            # We'll distribute it or use the per-choice usage if available (though unlikely in single payload)
+            # If total usage is provided at the top level
+            batch_usage = data.get("usage", {})
+            avg_usage = {
+                "prompt_tokens": batch_usage.get("prompt_tokens", 0) // len(futures) if futures else 0,
+                "completion_tokens": batch_usage.get("completion_tokens", 0) // len(futures) if futures else 0,
+                "total_tokens": batch_usage.get("total_tokens", 0) // len(futures) if futures else 0,
+                "time_taken": time_taken / len(futures) if futures else 0.0
+            }
+
+            for choice in choices:
+                idx = choice.get("index")
+                if idx is not None and idx < len(futures):
+                    text = choice.get("message", {}).get("content", "")
+                    # Note: vLLM might not provide per-choice usage in the batch response
+                    # If it does, we use it, otherwise use average
+                    choice_usage = choice.get("usage", avg_usage)
+                    if "time_taken" not in choice_usage:
+                        choice_usage["time_taken"] = avg_usage["time_taken"]
+                    
+                    if not futures[idx].done():
+                        futures[idx].set_result((text, choice_usage))
+
+            # Fail any futures that didn't get a result
+            for f in futures:
+                if not f.done():
+                    f.set_exception(Exception("No result returned for this request in vLLM batch response"))
+
+        except Exception as e:
+            self.logger.error(f"Error in vLLM batch processing: {e}")
             for f in futures:
                 if not f.done():
                     f.set_exception(e)
