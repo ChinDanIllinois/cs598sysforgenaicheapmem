@@ -25,5 +25,5 @@ echo "Starting vLLM CPU server on $CORES cores..."
 numactl --interleave=all vllm serve \
     --model "$VLLM_MODEL_NAME" \
     --port "$PORT" \
-    --max-model-len 8192 \
+    --max-model-len 32768 \
     --trust-remote-code

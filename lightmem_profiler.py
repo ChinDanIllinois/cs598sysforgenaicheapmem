@@ -744,7 +744,6 @@ async def run_sweep():
     for c in CONFIG["concurrency_levels"]:
         await run_single_concurrency(c)
     sweep_finished = True
-    download_csv(sweep_results)
 
 
 # ============================================================
