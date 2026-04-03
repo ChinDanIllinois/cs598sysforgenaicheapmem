@@ -6,16 +6,16 @@ class LlmLingua2Segmenter:
     def __init__(self, config: Optional[Dict] = None, shared: bool = False, compressor=None):
         self.config = config
 
-        if shared is False:
+        if shared is False or compressor is None:
             self.model = AutoModel.from_pretrained(
-                pretrained_model_name_or_path=self.config["model_name"],
+                pretrained_model_name_or_path=self.config.get("model_name"),
                 device_map=self.config.get("device_map", None),
                 torch_dtype=self.config.get("torch_dtype", None),
                 **self.config.get("model_config", {})
             ).eval()
-            self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.get("model_name"))
             self.buffer_len = self.config.get("buffer_len", 512)
-        elif compressor is not None:
+        else:
             self.model = compressor.inner_compressor.model
             self.tokenizer = compressor.inner_compressor.tokenizer
             self.buffer_len = getattr(self.model.config, "max_position_embeddings", 512)
