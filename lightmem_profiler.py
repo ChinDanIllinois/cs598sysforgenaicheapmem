@@ -91,8 +91,20 @@ def parse_args():
     parser.add_argument(
         "--provider",
         required=True,
-        choices=["ollama", "gemini", "openai", "mock"],
+        choices=["ollama", "gemini", "openai", "vllm", "mock"],
         help="LLM backend provider to use for memory management.",
+    )
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=1,
+        help="LLM batch size for compatible providers (e.g., vllm). Default: 1 (no batching).",
+    )
+    parser.add_argument(
+        "--llm-batch-timeout",
+        type=int,
+        default=10,
+        help="LLM batch timeout in seconds. Default: 10.",
     )
     parser.add_argument(
         "--rpm",
@@ -195,6 +207,16 @@ _PROVIDER_ENV_VARS = {
             "Obtain one at https://platform.openai.com/api-keys",
         ),
     ],
+    "vllm": [
+        (
+            "VLLM_MODEL_NAME",
+            "The vLLM model identifier (e.g. 'Qwen/Qwen2.5-3B-Instruct').",
+        ),
+        (
+            "VLLM_BASE_URL",
+            "The URL for the vLLM server (e.g. 'http://localhost:8000/v1').",
+        ),
+    ],
     "mock": [],
 }
 
@@ -261,6 +283,7 @@ _MODEL_NAME_ENV = {
     "ollama": "OLLAMA_MODEL_NAME",
     "gemini": "GEMINI_MODEL_NAME",
     "openai": "OPENAI_MODEL_NAME",
+    "vllm": "VLLM_MODEL_NAME",
     "mock": "MOCK_MODEL_NAME"
 }
 _resolved_model_name = os.getenv(_MODEL_NAME_ENV[args.provider], "unknown")
@@ -273,6 +296,8 @@ CONFIG = {
     "test_seconds":       args.test_seconds,
     "dashboard_port":     args.port,
     "rpm":                args.rpm,
+    "llm_batch_size":     args.llm_batch_size,
+    "llm_batch_timeout":  args.llm_batch_timeout,
 }
 
 rate_limiter = AsyncRateLimiter(CONFIG["rpm"])
@@ -309,6 +334,20 @@ def _memory_manager_config_gemini() -> dict:
     }
 
 
+def _memory_manager_config_vllm() -> dict:
+    return {
+        "model_name": "vllm",
+        "configs": {
+            "model":      os.getenv("VLLM_MODEL_NAME"),
+            "api_key":    os.getenv("VLLM_API_KEY", "EMPTY"),
+            "max_tokens": 16384,
+            "vllm_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+            "llm_batch_size": CONFIG["llm_batch_size"],
+            "llm_batch_timeout": CONFIG["llm_batch_timeout"],
+        },
+    }
+
+
 def _memory_manager_config_openai() -> dict:
     return {
         "model_name": "openai",
@@ -334,6 +373,7 @@ _MEMORY_MANAGER_BUILDERS = {
     "ollama": _memory_manager_config_ollama,
     "gemini": _memory_manager_config_gemini,
     "openai": _memory_manager_config_openai,
+    "vllm":   _memory_manager_config_vllm,
     "mock":   _memory_manager_config_mock,
 }
 
@@ -704,6 +744,7 @@ async def run_sweep():
     for c in CONFIG["concurrency_levels"]:
         await run_single_concurrency(c)
     sweep_finished = True
+    download_csv(sweep_results)
 
 
 # ============================================================

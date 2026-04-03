@@ -22,7 +22,7 @@ PORT=8000
 echo "Starting vLLM CPU server on $CORES cores..."
 # Use numactl to ensure memory is shared across the whole node
 # (If numactl is not installed, the server will still run)
-numactl --interleave=all python3 -m vllm.entrypoints.openai.api_server \
+numactl --interleave=all vllm serve \
     --model "$VLLM_MODEL_NAME" \
     --port "$PORT" \
     --max-model-len 8192 \

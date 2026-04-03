@@ -109,6 +109,8 @@ def load_lightmem(collection_name):
                 "vllm_base_url": your_vllm_base_url,
                 "api_key": your_vllm_api_key,
                 "max_tokens": 4096,
+                "llm_batch_size": 16,
+                "llm_batch_timeout": 10,
             }
         },
         "extract_threshold": 0.1,
