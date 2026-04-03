@@ -29,7 +29,7 @@ class VllmManager:
             or "http://localhost:8000/v1"
         )
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=30)
 
     def _parse_response(self, response, tools):
         """
