@@ -17,7 +17,7 @@ your_ollama_JUDGE_model_name = os.getenv("OLLAMA_JUDGE_MODEL_NAME", "kimi-k2.5:c
 # Gemma3 is used for LightMem's internal memory manager because it reliably
 # returns valid JSON for metadata generation. Kimi returns empty responses
 # to those prompts, causing "JSON decoding error" and 0 memories stored.
-your_ollama_MEMORY_MANAGER_model_name = os.getenv("OLLAMA_MEMORY_MANAGER_MODEL_NAME", "gemma3:27b-cloud")
+your_ollama_MEMORY_MANAGER_model_name = os.getenv("OLLAMA_MODEL_NAME", "gemma3:27b-cloud")
 your_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 your_ollama_options_stable = {
     "num_ctx": 8192,

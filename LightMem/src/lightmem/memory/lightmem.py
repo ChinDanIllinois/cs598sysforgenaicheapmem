@@ -2,6 +2,8 @@ import uuid
 import re
 import copy
 import concurrent
+import os
+import concurrent.futures
 import logging
 import json
 import asyncio
@@ -139,7 +141,12 @@ class LightMemory:
         if config.logging is not None:
             config.logging.apply()
         
-        self.logger = get_logger("LightMemory")
+        self.logger = get_logger(self.__class__.__name__)
+        # Create a thread pool executor for offloading blocking work.
+        # If the environment variable DISABLE_PARALLEL is set (any value), limit to a single worker
+        # to avoid deadlocks when only one asyncio task is running.
+        max_workers = 1 if os.getenv("DISABLE_PARALLEL") else os.cpu_count()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         self.logger.info("Initializing LightMemory with provided configuration")
         self.token_stats = {
             "add_memory_calls": 0,
@@ -422,7 +429,7 @@ class LightMemory:
             else:
                 args = (msgs,)
             loop = asyncio.get_event_loop()
-            compressed_messages = await loop.run_in_executor(None, lambda: self.compressor.compress(*args))
+            compressed_messages = await loop.run_in_executor(self.executor, lambda: self.compressor.compress(*args))
         else:
             compressed_messages = msgs
             self.logger.info(f"[{call_id}] Pre-compression disabled, using normalized messages")
@@ -441,10 +448,10 @@ class LightMemory:
             }
 
         loop = asyncio.get_event_loop()
-        all_segments = await loop.run_in_executor(None, lambda: self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder))
+        all_segments = await loop.run_in_executor(self.executor, lambda: self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder))
 
         if force_segment:
-            all_segments = await loop.run_in_executor(None, lambda: self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment))
+            all_segments = await loop.run_in_executor(self.executor, lambda: self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment))
         
         t_segment = time.perf_counter()
         self.token_stats["stage_segment_time"] = self.token_stats.get("stage_segment_time", 0.0) + (t_segment - t_compress)
@@ -453,7 +460,7 @@ class LightMemory:
             return result
 
         loop = asyncio.get_event_loop()
-        extract_trigger_num, extract_list = await loop.run_in_executor(None, lambda: self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract))
+        extract_trigger_num, extract_list = await loop.run_in_executor(self.executor, lambda: self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract))
 
         if extract_trigger_num == 0:
             return result
@@ -520,9 +527,9 @@ class LightMemory:
         t_db_start = time.perf_counter()
         loop = asyncio.get_event_loop()
         if self.config.update == "online":
-            await loop.run_in_executor(None, lambda: self.online_update(memory_entries))
+            await loop.run_in_executor(self.executor, lambda: self.online_update(memory_entries))
         elif self.config.update == "offline":
-            await loop.run_in_executor(None, lambda: self.offline_update(memory_entries))
+            await loop.run_in_executor(self.executor, lambda: self.offline_update(memory_entries))
         t_db_end = time.perf_counter()
         self.token_stats["stage_db_insert_time"] = self.token_stats.get("stage_db_insert_time", 0.0) + (t_db_end - t_db_start)
         
@@ -1023,3 +1030,11 @@ class LightMemory:
         result = build_batch_result(summaries, total_entries, call_id, self.logger)
         self.logger.info(f"========== END {call_id} ==========")
         return result
+
+    def close(self):
+        """Shut down the thread‑pool executor when the LightMemory instance is no longer needed."""
+        try:
+            self.executor.shutdown(wait=True)
+            self.logger.info("Thread‑pool executor shut down")
+        except Exception as e:
+            self.logger.error(f"Error shutting down executor: {e}")
