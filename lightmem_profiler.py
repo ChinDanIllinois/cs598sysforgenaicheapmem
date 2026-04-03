@@ -430,10 +430,10 @@ def get_current_timestamp():
     return now.strftime(f"%Y/%m/%d ({now.strftime('%a')}) %H:%M:%S")
 
 
-def get_sample(worker_id: int, i: int):
+def get_sample(worker_id: int, concurrency: int, i: int):
     """Return a message list for this worker's i-th request."""
     if DATASET:
-        idx = (worker_id * 10007 + i) % len(DATASET)
+        idx = (worker_id * 70 * concurrency + i) % len(DATASET)
         return DATASET[idx]
     return [
         {
@@ -579,11 +579,11 @@ total_attempts = 0
 # WORKERS
 # ============================================================
 
-async def worker(worker_id, stop_event):
+async def worker(worker_id, concurrency, stop_event):
     global total_writes, total_latency, total_errors, total_attempts
     i = 0
     while not stop_event.is_set():
-        messages = get_sample(worker_id, i)
+        messages = get_sample(worker_id, concurrency, i)
         start_t  = time.perf_counter()
         with metrics_lock:
             total_attempts += 1
@@ -639,7 +639,7 @@ async def run_single_concurrency(concurrency):
     live_errors_per_sec.clear()
 
     stop_event = asyncio.Event()
-    workers    = [asyncio.create_task(worker(i, stop_event)) for i in range(concurrency)]
+    workers    = [asyncio.create_task(worker(i, concurrency, stop_event)) for i in range(concurrency)]
 
     start       = time.perf_counter()
     last_sample = start
