@@ -811,6 +811,7 @@ _PROVIDER_LABEL = {
     "ollama": f"Ollama ({os.getenv('OLLAMA_MODEL_NAME', 'unknown')})",
     "gemini": f"Gemini ({os.getenv('GEMINI_MODEL_NAME', 'unknown')})",
     "openai": f"OpenAI ({os.getenv('OPENAI_MODEL_NAME', 'unknown')})",
+    "vllm":   f"vLLM ({os.getenv('VLLM_MODEL_NAME', 'unknown')})",
     "mock":   "Mock Provider (Simulated)",
 }
 
