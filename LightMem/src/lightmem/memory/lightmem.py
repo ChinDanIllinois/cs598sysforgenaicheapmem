@@ -31,9 +31,9 @@ from lightmem.memory.utils import (
 )
 from lightmem.memory.prompts import METADATA_GENERATE_PROMPT, UPDATE_PROMPT
 from lightmem.configs.logging.utils import get_logger
-
-GLOBAL_TOPIC_IDX = 0
-GLOBAL_LAST_SUMMARY_TIME = None
+import queue
+from lightmem.memory.tenant import TenantState
+from lightmem.memory.queue_types import ExtractionJob
 
 
 class MessageNormalizer:
@@ -246,6 +246,7 @@ class LightMemory:
     def add_memory(
         self,
         messages,
+        user_id: str,
         METADATA_GENERATE_PROMPT: Optional[Union[str, Dict[str, str]]] = None,
         *,
         force_segment: bool = False,
@@ -269,6 +270,8 @@ class LightMemory:
             "api_call_nums": 0
         }
 
+        tenant = self._get_tenant(user_id)
+        
         self.logger.debug(f"[{call_id}] Raw input type: {type(messages)}")
         if isinstance(messages, list):
             self.logger.debug(f"[{call_id}] Raw input sample: {json.dumps(messages)}")
@@ -451,6 +454,82 @@ class LightMemory:
     def online_update(self, memory_list: List):
         return None
 
+    def _batch_worker(self):
+        import time as _time
+        self.logger.info("Batch worker thread started. Listening for extraction jobs.")
+        while True:
+            try:
+                job = self.extraction_queue.get()
+                if job is None:
+                    break
+                call_id = f"worker_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                self.logger.info(f"========== START {call_id} ==========")
+                self.logger.info(f"[{call_id}] Processing background extraction for User: {job.user_id}")
+                
+                extract_list = job.extract_list
+                topic_id_mapping = job.topic_id_mapping
+                tenant = self._get_tenant(job.user_id)
+                
+                extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
+                max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
+                
+                extracted_results = []
+                _t0 = _time.perf_counter()
+                if self.config.metadata_generate and self.config.text_summary:
+                    try:
+                        extracted_results = self.manager.meta_text_extract(
+                            extract_list=extract_list,
+                            messages_use=self.config.messages_use,
+                            topic_id_mapping=topic_id_mapping,
+                            extraction_mode=self.config.extraction_mode,
+                            custom_prompts=None  
+                        )
+                    except Exception as e:
+                        with tenant.lock:
+                            tenant.token_stats["add_memory_errors"] += 1
+                        self.logger.error(f"[{call_id}] Background extraction failed: {e}")
+                        job.future.set_exception(e)
+                        self.extraction_queue.task_done()
+                        continue
+
+                    _t_llm_extract = _time.perf_counter() - _t0
+                    result_dict = {"add_input_prompt": [], "add_output_prompt": [], "api_call_nums": 0}
+                    process_extraction_results(
+                        extracted_results=extracted_results,
+                        token_stats=tenant.token_stats,
+                        result_dict=result_dict,
+                        call_id=call_id,
+                        logger=self.logger,
+                        lock=tenant.lock
+                    )
+
+                memory_entries = convert_extraction_results_to_memory_entries(
+                    extracted_results=extracted_results,
+                    timestamps_list=timestamps_list,
+                    weekday_list=weekday_list,
+                    speaker_list=speaker_list,
+                    topic_id_map=topic_id_map,
+                    max_source_ids=max_source_ids,
+                    logger=self.logger
+                )
+                
+                # Assign user_id to all generated MemoryEntry objects
+                for mem in memory_entries:
+                    mem.user_id = job.user_id
+
+                _t0 = _time.perf_counter()
+                if self.config.update == "online":
+                    self.online_update(memory_entries)
+                elif self.config.update == "offline":
+                    self.offline_update(memory_entries)
+                _t_db_insert = _time.perf_counter() - _t0
+                
+                job.future.set_result(True)
+                self.extraction_queue.task_done()
+                self.logger.info(f"========== END {call_id} ==========")
+            except Exception as e:
+                self.logger.error(f"Batch worker encoutered fatal error: {e}")
+
     def offline_update(self, memory_list: List, construct_update_queue_trigger: bool = False, offline_update_trigger: bool = False):
         call_id = f"offline_update_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
@@ -488,6 +567,7 @@ class LightMemory:
                     "speaker_id": mem_obj.speaker_id,
                     "speaker_name": mem_obj.speaker_name,
                     "consolidated": mem_obj.consolidated,
+                    "user_id": mem_obj.user_id,
                 }
                 self.embedding_retriever.insert(
                     vectors=[embedding_vector],

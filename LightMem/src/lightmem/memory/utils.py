@@ -30,6 +30,7 @@ class MemoryEntry:
     hit_time: int = 0
     update_queue: List = field(default_factory=list)
     consolidated: bool = False
+    user_id: Optional[str] = None
     
 def clean_response(response: str) -> List[Dict[str, Any]]:
     """
@@ -154,6 +155,7 @@ def save_memory_entries(memory_entries, file_path="memory_entries.json"):
             "speaker_id": getattr(entry, "speaker_id", ""),  
             "speaker_name": getattr(entry, "speaker_name", ""),  
             "consolidated": getattr(entry, "consolidated", False),  
+            "user_id": getattr(entry, "user_id", None),
         }
 
     if os.path.exists(file_path):
@@ -345,6 +347,7 @@ def _create_memory_entry_from_fact(
         topic_id=topic_id,
         topic_summary=topic_summary,
         consolidated=False, 
+        user_id=None,
     )
     
     return mem_obj
