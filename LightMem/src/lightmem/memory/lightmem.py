@@ -23,6 +23,7 @@ from lightmem.memory.prompts import METADATA_GENERATE_PROMPT, UPDATE_PROMPT
 from lightmem.configs.logging.utils import get_logger
 
 GLOBAL_TOPIC_IDX = 0
+_TOPIC_LOCK = threading.Lock()
 GLOBAL_LAST_SUMMARY_TIME = None
 
 class MessageNormalizer:
@@ -169,6 +170,7 @@ class LightMemory:
             "summarize_errors": 0,
         }
         self._token_stats_lock = threading.Lock()
+        self._buffer_lock = threading.Lock()
         self.logger.info("Token statistics tracking initialized")
         
         self.config = config
@@ -326,41 +328,45 @@ class LightMemory:
                 "carryover_size": 0,
             }
 
-        _t0 = _time.perf_counter()
-        all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
+        with self._buffer_lock:
+            _t0 = _time.perf_counter()
+            all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
 
-        if force_segment:
-            all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
-        _t_segment = _time.perf_counter() - _t0
-        
-        if not all_segments:
-            self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
-            return result # TODO
+            if force_segment:
+                all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+            _t_segment = _time.perf_counter() - _t0
+            
+            if not all_segments:
+                self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
+                return result # TODO
 
-        self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
-        self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
+            self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
+            self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
 
-        extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
+            extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
 
-        if extract_trigger_num == 0:
-            self.logger.debug(f"[{call_id}] Extraction not triggered, returning result")
-            return result # TODO 
-        
-        global GLOBAL_TOPIC_IDX
-        topic_id_mapping = []
-        for api_call_segments in extract_list:
-            api_call_topic_ids = []
-            for topic_segment in api_call_segments:
-                api_call_topic_ids.append(GLOBAL_TOPIC_IDX)
-                GLOBAL_TOPIC_IDX += 1
-            topic_id_mapping.append(api_call_topic_ids)
-        self.logger.debug(f"topic_id_mapping: {topic_id_mapping}")
-        self.logger.info(f"[{call_id}] Assigned global topic IDs: total={sum(len(x) for x in topic_id_mapping)}, mapping={topic_id_mapping}")
-        self.logger.info(f"[{call_id}] Extraction triggered {extract_trigger_num} times, extract_list length: {len(extract_list)}")
-        extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
-        self.logger.debug(f"[{call_id}] Extract list sample: {json.dumps(extract_list)}")
-        max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
-        self.logger.info(f"[{call_id}] Batch max_source_ids: {max_source_ids}")
+            if extract_trigger_num == 0:
+                self.logger.debug(f"[{call_id}] Extraction not triggered, returning result")
+                return result # TODO 
+            
+            global GLOBAL_TOPIC_IDX
+            topic_id_mapping = []
+            with _TOPIC_LOCK:
+                for api_call_segments in extract_list:
+                    api_call_topic_ids = []
+                    for topic_segment in api_call_segments:
+                        api_call_topic_ids.append(GLOBAL_TOPIC_IDX)
+                        GLOBAL_TOPIC_IDX += 1
+                    topic_id_mapping.append(api_call_topic_ids)
+
+            self.logger.debug(f"topic_id_mapping: {topic_id_mapping}")
+            self.logger.info(f"[{call_id}] Assigned global topic IDs: total={sum(len(x) for x in topic_id_mapping)}, mapping={topic_id_mapping}")
+            self.logger.info(f"[{call_id}] Extraction triggered {extract_trigger_num} times, extract_list length: {len(extract_list)}")
+            extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
+            self.logger.debug(f"[{call_id}] Extract list sample: {json.dumps(extract_list)}")
+            max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
+            self.logger.info(f"[{call_id}] Batch max_source_ids: {max_source_ids}")
+
         if self.config.metadata_generate and self.config.text_summary:
             self.logger.info(f"[{call_id}] Starting metadata generation")
             _t0 = _time.perf_counter()

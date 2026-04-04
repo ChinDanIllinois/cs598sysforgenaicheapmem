@@ -257,10 +257,11 @@ def convert_extraction_results_to_memory_entries(
                 seq_candidate = sid * 2
                 
                 if seq_candidate not in topic_id_map:
+                    range_info = f"{min(topic_id_map.keys())}-{max(topic_id_map.keys())}" if topic_id_map else "None"
                     logger.error(
                         f"sequence {seq_candidate} (from corrected source_id={sid}) "
                         f"not found in topic_id_map. "
-                        f"Available range: {min(topic_id_map.keys())}-{max(topic_id_map.keys())}. "
+                        f"Available range: {range_info}. "
                         f"Skipping this fact."
                     )
                     continue
