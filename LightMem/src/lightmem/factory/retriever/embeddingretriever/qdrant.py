@@ -364,23 +364,25 @@ class Qdrant:
             logger.error(f"Error checking existence of ID {vector_id}: {e}")
             return False
         
-    def get_all(self, with_vectors: bool = True, with_payload: bool = True) -> list:
+    def get_all(self, with_vectors: bool = True, with_payload: bool = True, filters: dict = None) -> list:
         """
         Retrieve all points from the collection.
 
         Args:
             with_vectors (bool): Whether to include vectors. Defaults to True.
             with_payload (bool): Whether to include payload. Defaults to True.
+            filters (dict, optional): Filters to apply. Defaults to None.
 
         Returns:
             list: List of all points with their vectors and payloads.
         """
         all_points = []
         offset = None
+        query_filter = self._create_filter(filters) if filters else None
         while True:
             result, offset = self.client.scroll(
                 collection_name=self.collection_name,
-                scroll_filter=None,
+                scroll_filter=query_filter,
                 limit=100, 
                 with_payload=with_payload,
                 with_vectors=with_vectors,

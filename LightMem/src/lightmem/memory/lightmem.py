@@ -21,9 +21,9 @@ from lightmem.factory.memory_buffer.short_term_memory import ShortMemBufferManag
 from lightmem.memory.utils import MemoryEntry, assign_sequence_numbers_with_timestamps, save_memory_entries,convert_extraction_results_to_memory_entries,normalize_extraction_prompts,process_extraction_results
 from lightmem.memory.prompts import METADATA_GENERATE_PROMPT, UPDATE_PROMPT
 from lightmem.configs.logging.utils import get_logger
-
-GLOBAL_TOPIC_IDX = 0
-GLOBAL_LAST_SUMMARY_TIME = None
+import queue
+from lightmem.memory.tenant import TenantState
+from lightmem.memory.queue_types import ExtractionJob
 
 class MessageNormalizer:
 
@@ -172,16 +172,18 @@ class LightMemory:
         self.logger.info("Token statistics tracking initialized")
         
         self.config = config
+        self._tenants: Dict[str, TenantState] = {}
+        self._tenants_lock = threading.Lock()
+        self.extraction_queue = queue.Queue()
+        
         if self.config.pre_compress:
             self.logger.info("Initializing pre-compressor")
             self.compressor = PreCompressorFactory.from_config(self.config.pre_compressor)
         if self.config.topic_segment:
             self.logger.info("Initializing topic segmenter")
-            self.segmenter = TopicSegmenterFactory.from_config(self.config.topic_segmenter, self.config.precomp_topic_shared, self.compressor)
-            self.senmem_buffer_manager = SenMemBufferManager(max_tokens=self.segmenter.buffer_len, tokenizer=self.segmenter.tokenizer)
+            self.segmenter = TopicSegmenterFactory.from_config(self.config.topic_segmenter, self.config.precomp_topic_shared, getattr(self, "compressor", None))
         self.logger.info("Initializing memory manager")
         self.manager = MemoryManagerFactory.from_config(self.config.memory_manager)
-        self.shortmem_buffer_manager = ShortMemBufferManager(max_tokens = 512, tokenizer=getattr(self.manager, "tokenizer", self.manager.config.model))
         if self.config.index_strategy == 'embedding' or self.config.index_strategy == 'hybrid':
             self.logger.info("Initializing text embedder")
             self.text_embedder = TextEmbedderFactory.from_config(self.config.text_embedder)
@@ -200,7 +202,21 @@ class LightMemory:
             from .graph import GraphMem
             self.logger.info("Initializing graph memory")
             self.graph = GraphMem(self.config.graph_mem)
-        self.logger.info("LightMemory initialization completed successfully")
+            
+        self._batch_worker_thread = threading.Thread(target=self._batch_worker, daemon=True)
+        self._batch_worker_thread.start()
+        self.logger.info("LightMemory multi-tenant worker initialized successfully")
+
+    def _get_tenant(self, user_id: str) -> TenantState:
+        with self._tenants_lock:
+            if user_id not in self._tenants:
+                tenant = TenantState(user_id=user_id)
+                if self.config.topic_segment:
+                    tenant.senmem_buffer_manager = SenMemBufferManager(max_tokens=self.segmenter.buffer_len, tokenizer=self.segmenter.tokenizer)
+                tenant.shortmem_buffer_manager = ShortMemBufferManager(max_tokens=512, tokenizer=getattr(self.manager, "tokenizer", self.manager.config.model))
+                self._tenants[user_id] = tenant
+            return self._tenants[user_id]
+
 
     @classmethod
     def from_config(cls, config: Dict[str,Any]):
@@ -215,6 +231,7 @@ class LightMemory:
     def add_memory(
         self,
         messages,
+        user_id: str,
         METADATA_GENERATE_PROMPT: Optional[Union[str, Dict[str, str]]] = None,
         *,
         force_segment: bool = False, 
@@ -285,6 +302,8 @@ class LightMemory:
         _t_llm_extract = 0.0
         _t_db_insert = 0.0
 
+        tenant = self._get_tenant(user_id)
+        
         self.logger.debug(f"[{call_id}] Raw input type: {type(messages)}")
         if isinstance(messages, list):
             self.logger.debug(f"[{call_id}] Raw input sample: {json.dumps(messages)}")
@@ -327,10 +346,10 @@ class LightMemory:
             }
 
         _t0 = _time.perf_counter()
-        all_segments = self.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
+        all_segments = tenant.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
 
         if force_segment:
-            all_segments = self.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+            all_segments = tenant.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
         _t_segment = _time.perf_counter() - _t0
         
         if not all_segments:
@@ -340,96 +359,113 @@ class LightMemory:
         self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
         self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
 
-        extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
+        extract_trigger_num, extract_list = tenant.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
 
         if extract_trigger_num == 0:
             self.logger.debug(f"[{call_id}] Extraction not triggered, returning result")
             return result # TODO 
         
-        global GLOBAL_TOPIC_IDX
         topic_id_mapping = []
-        for api_call_segments in extract_list:
-            api_call_topic_ids = []
-            for topic_segment in api_call_segments:
-                api_call_topic_ids.append(GLOBAL_TOPIC_IDX)
-                GLOBAL_TOPIC_IDX += 1
-            topic_id_mapping.append(api_call_topic_ids)
+        with tenant.lock:
+            for api_call_segments in extract_list:
+                api_call_topic_ids = []
+                for topic_segment in api_call_segments:
+                    api_call_topic_ids.append(tenant.topic_idx)
+                    tenant.topic_idx += 1
+                topic_id_mapping.append(api_call_topic_ids)
         self.logger.debug(f"topic_id_mapping: {topic_id_mapping}")
-        self.logger.info(f"[{call_id}] Assigned global topic IDs: total={sum(len(x) for x in topic_id_mapping)}, mapping={topic_id_mapping}")
-        self.logger.info(f"[{call_id}] Extraction triggered {extract_trigger_num} times, extract_list length: {len(extract_list)}")
-        extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
-        self.logger.debug(f"[{call_id}] Extract list sample: {json.dumps(extract_list)}")
-        max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
-        self.logger.info(f"[{call_id}] Batch max_source_ids: {max_source_ids}")
-        if self.config.metadata_generate and self.config.text_summary:
-            self.logger.info(f"[{call_id}] Starting metadata generation")
-            _t0 = _time.perf_counter()
-            try:
-                extracted_results = self.manager.meta_text_extract(
-                    extract_list=extract_list,
-                    messages_use=self.config.messages_use,
-                    topic_id_mapping=topic_id_mapping,
-                    extraction_mode=self.config.extraction_mode,
-                    custom_prompts=extract_prompts  
-                )
-            except Exception as e:
-                with self._token_stats_lock:
-                    self.token_stats["add_memory_errors"] += 1
-                self.logger.error(f"[{call_id}] Extraction failed: {e}")
-                raise e
-            _t_llm_extract = _time.perf_counter() - _t0
-            # ============ API token Consumption ============
-            process_extraction_results(
-                extracted_results=extracted_results,
-                token_stats=self.token_stats,
-                result_dict=result,
-                call_id=call_id,
-                logger=self.logger,
-                lock=self._token_stats_lock
-            )
-            self.logger.info(f"[{call_id}] Metadata generation completed with {result['api_call_nums']} API calls")
-
-        memory_entries = convert_extraction_results_to_memory_entries(
-            extracted_results=extracted_results,
-            timestamps_list=timestamps_list,
-            weekday_list=weekday_list,
-            speaker_list=speaker_list,
-            topic_id_map=topic_id_map,
-            max_source_ids=max_source_ids,
-            logger=self.logger
+        self.logger.info(f"[{call_id}] Enqueuing ExtractionJob for user {user_id}")
+        future = concurrent.futures.Future()
+        job = ExtractionJob(
+            user_id=user_id,
+            extract_list=extract_list,
+            topic_id_mapping=topic_id_mapping,
+            future=future
         )
-        self.logger.info(f"[{call_id}] Created {len(memory_entries)} MemoryEntry objects")
-        for i, mem in enumerate(memory_entries):
-            self.logger.debug(f"[{call_id}] MemoryEntry[{i}]: time={mem.time_stamp}, weekday={mem.weekday}, speaker_id={mem.speaker_id}, speaker_name={mem.speaker_name}, topic_id={mem.topic_id}, memory={mem.memory}")
-
-        _t0 = _time.perf_counter()
-        if self.config.update == "online":
-            self.online_update(memory_entries)
-        elif self.config.update == "offline":
-            self.offline_update(memory_entries)
-        _t_db_insert = _time.perf_counter() - _t0
-
-        # Accumulate stage timings (thread-safe)
-        with self._token_stats_lock:
-            self.token_stats["stage_compress_time"] += _t_compress
-            self.token_stats["stage_segment_time"] += _t_segment
-            self.token_stats["stage_llm_extract_time"] += _t_llm_extract
-            self.token_stats["stage_db_insert_time"] += _t_db_insert
+        self.extraction_queue.put(job)
         
-        self.logger.info(
-            f"[{call_id}] Cumulative token stats - "
-            f"Total API calls: {self.token_stats['add_memory_calls']}, "
-            f"Total tokens: {self.token_stats['add_memory_total_tokens']}"
-        )
-        self.logger.debug(
-            f"[{call_id}] Stage timings: compress={_t_compress:.3f}s, "
-            f"segment={_t_segment:.3f}s, llm_extract={_t_llm_extract:.3f}s, "
-            f"db_insert={_t_db_insert:.3f}s"
-        )
+        # We don't block. The metrics will be updated by the batch_worker asynchronously.
+        result["async_job_enqueued"] = True
         return result
 
     def online_update(self, memory_list: List):
         return None
+
+    def _batch_worker(self):
+        import time as _time
+        self.logger.info("Batch worker thread started. Listening for extraction jobs.")
+        while True:
+            try:
+                job = self.extraction_queue.get()
+                if job is None:
+                    break
+                call_id = f"worker_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                self.logger.info(f"========== START {call_id} ==========")
+                self.logger.info(f"[{call_id}] Processing background extraction for User: {job.user_id}")
+                
+                extract_list = job.extract_list
+                topic_id_mapping = job.topic_id_mapping
+                tenant = self._get_tenant(job.user_id)
+                
+                extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
+                max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
+                
+                extracted_results = []
+                _t0 = _time.perf_counter()
+                if self.config.metadata_generate and self.config.text_summary:
+                    try:
+                        extracted_results = self.manager.meta_text_extract(
+                            extract_list=extract_list,
+                            messages_use=self.config.messages_use,
+                            topic_id_mapping=topic_id_mapping,
+                            extraction_mode=self.config.extraction_mode,
+                            custom_prompts=None  
+                        )
+                    except Exception as e:
+                        with tenant.lock:
+                            tenant.token_stats["add_memory_errors"] += 1
+                        self.logger.error(f"[{call_id}] Background extraction failed: {e}")
+                        job.future.set_exception(e)
+                        self.extraction_queue.task_done()
+                        continue
+
+                    _t_llm_extract = _time.perf_counter() - _t0
+                    result_dict = {"add_input_prompt": [], "add_output_prompt": [], "api_call_nums": 0}
+                    process_extraction_results(
+                        extracted_results=extracted_results,
+                        token_stats=tenant.token_stats,
+                        result_dict=result_dict,
+                        call_id=call_id,
+                        logger=self.logger,
+                        lock=tenant.lock
+                    )
+
+                memory_entries = convert_extraction_results_to_memory_entries(
+                    extracted_results=extracted_results,
+                    timestamps_list=timestamps_list,
+                    weekday_list=weekday_list,
+                    speaker_list=speaker_list,
+                    topic_id_map=topic_id_map,
+                    max_source_ids=max_source_ids,
+                    logger=self.logger
+                )
+                
+                # Assign user_id to all generated MemoryEntry objects
+                for mem in memory_entries:
+                    mem.user_id = job.user_id
+
+                _t0 = _time.perf_counter()
+                if self.config.update == "online":
+                    self.online_update(memory_entries)
+                elif self.config.update == "offline":
+                    self.offline_update(memory_entries)
+                _t_db_insert = _time.perf_counter() - _t0
+                
+                job.future.set_result(True)
+                self.extraction_queue.task_done()
+                self.logger.info(f"========== END {call_id} ==========")
+            except Exception as e:
+                self.logger.error(f"Batch worker encoutered fatal error: {e}")
 
     def offline_update(self, memory_list: List, construct_update_queue_trigger: bool = False, offline_update_trigger: bool = False):
         call_id = f"offline_update_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -465,6 +501,7 @@ class LightMemory:
                     "speaker_id": mem_obj.speaker_id,
                     "speaker_name": mem_obj.speaker_name,
                     "consolidated": mem_obj.consolidated,
+                    "user_id": mem_obj.user_id,
                 }
                 self.embedding_retriever.insert(
                     vectors = [embedding_vector],
@@ -696,12 +733,13 @@ class LightMemory:
         )
         self.logger.info(f"========== END {call_id} ==========")
     
-    def retrieve(self, query: str, limit: int = 10, filters: Optional[dict] = None) -> list[str]:
+    def retrieve(self, query: str, user_id: str, limit: int = 10, filters: Optional[dict] = None) -> list[str]:
         """
         Retrieve relevant entries and return them as formatted strings.
 
         Args:
             query (str): The natural language query string.
+            user_id (str): The tenant user ID.
             limit (int, optional): Number of results to return. Defaults to 10.
             filters (dict, optional): Optional filters to narrow down the search. Defaults to None.
 
@@ -716,7 +754,11 @@ class LightMemory:
         self.logger.debug(f"[{call_id}] Generating embedding for query")
         query_vector = self.text_embedder.embed(query)
         self.logger.debug(f"[{call_id}] Query embedding dimension: {len(query_vector)}")
-        self.logger.info(f"[{call_id}] Searching vector database")
+        if filters is None:
+            filters = {}
+        filters["user_id"] = user_id
+        
+        self.logger.info(f"[{call_id}] Searching vector database for user {user_id}")
         results = self.embedding_retriever.search(
             query_vector=query_vector,
             limit=limit,
@@ -742,82 +784,84 @@ class LightMemory:
         embedder_stats = {"total_calls": 0, "total_tokens": None, "total_time": 0.0}
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'get_stats'):
             embedder_stats = self.text_embedder.get_stats()
+            
+        aggregated_stats = {
+            "add_memory_calls": 0, "add_memory_prompt_tokens": 0, "add_memory_completion_tokens": 0,
+            "add_memory_total_tokens": 0, "add_memory_time": 0.0, "update_calls": 0,
+            "update_prompt_tokens": 0, "update_completion_tokens": 0, "update_total_tokens": 0,
+            "update_time": 0.0, "summarize_calls": 0, "summarize_prompt_tokens": 0,
+            "summarize_completion_tokens": 0, "summarize_total_tokens": 0, "summarize_time": 0.0,
+            "stage_compress_time": 0.0, "stage_segment_time": 0.0, "stage_llm_extract_time": 0.0,
+            "stage_db_insert_time": 0.0, "add_memory_errors": 0, "update_errors": 0,
+            "summarize_errors": 0
+        }
         
-        with self._token_stats_lock:
-            stats = {
-                "summary": {
-                    "total_llm_calls": self.token_stats["add_memory_calls"] + self.token_stats["update_calls"] + self.token_stats["summarize_calls"],
-                    "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
-                    "total_llm_time": self.token_stats.get("add_memory_time", 0.0) + self.token_stats.get("update_time", 0.0) + self.token_stats.get("summarize_time", 0.0),
-                    "total_llm_errors": self.token_stats.get("add_memory_errors", 0) + self.token_stats.get("update_errors", 0) + self.token_stats.get("summarize_errors", 0),
-                    "total_embedding_calls": embedder_stats["total_calls"],
-                    "total_embedding_tokens": embedder_stats["total_tokens"],
-                    "total_embedding_time": embedder_stats.get("total_time", 0.0),
+        with self._tenants_lock:
+            for tenant in self._tenants.values():
+                with tenant.lock:
+                    for k in aggregated_stats:
+                        aggregated_stats[k] += tenant.token_stats.get(k, 0)
+        
+        stats = {
+            "summary": {
+                "total_llm_calls": aggregated_stats["add_memory_calls"] + aggregated_stats["update_calls"] + aggregated_stats["summarize_calls"],
+                "total_llm_tokens": aggregated_stats["add_memory_total_tokens"] + aggregated_stats["update_total_tokens"] + aggregated_stats["summarize_total_tokens"],
+                "total_llm_time": aggregated_stats["add_memory_time"] + aggregated_stats["update_time"] + aggregated_stats["summarize_time"],
+                "total_llm_errors": aggregated_stats["add_memory_errors"] + aggregated_stats["update_errors"] + aggregated_stats["summarize_errors"],
+                "total_embedding_calls": embedder_stats["total_calls"],
+                "total_embedding_tokens": embedder_stats["total_tokens"],
+                "total_embedding_time": embedder_stats.get("total_time", 0.0),
+            },
+            "llm": {
+                "add_memory": {
+                    "calls": aggregated_stats["add_memory_calls"],
+                    "prompt_tokens": aggregated_stats["add_memory_prompt_tokens"],
+                    "completion_tokens": aggregated_stats["add_memory_completion_tokens"],
+                    "total_tokens": aggregated_stats["add_memory_total_tokens"],
                 },
-                "llm": {
-                    "add_memory": {
-                        "calls": self.token_stats["add_memory_calls"],
-                        "prompt_tokens": self.token_stats["add_memory_prompt_tokens"],
-                        "completion_tokens": self.token_stats["add_memory_completion_tokens"],
-                        "total_tokens": self.token_stats["add_memory_total_tokens"],
-                    },
-                    "update": {
-                        "calls": self.token_stats["update_calls"],
-                        "prompt_tokens": self.token_stats["update_prompt_tokens"],
-                        "completion_tokens": self.token_stats["update_completion_tokens"],
-                        "total_tokens": self.token_stats["update_total_tokens"],
-                    },
-                    "summarize": {
-                    "calls": self.token_stats["summarize_calls"],
-                    "prompt_tokens": self.token_stats["summarize_prompt_tokens"],
-                    "completion_tokens": self.token_stats["summarize_completion_tokens"],
-                    "total_tokens": self.token_stats["summarize_total_tokens"],
-                    },
+                "update": {
+                    "calls": aggregated_stats["update_calls"],
+                    "prompt_tokens": aggregated_stats["update_prompt_tokens"],
+                    "completion_tokens": aggregated_stats["update_completion_tokens"],
+                    "total_tokens": aggregated_stats["update_total_tokens"],
                 },
-                "embedding": {
-                    "total_calls": embedder_stats["total_calls"],
-                    "total_tokens": embedder_stats["total_tokens"],
-                    "note": "Includes topic segmentation + memory indexing. Local models show None for tokens."
+                "summarize": {
+                    "calls": aggregated_stats["summarize_calls"],
+                    "prompt_tokens": aggregated_stats["summarize_prompt_tokens"],
+                    "completion_tokens": aggregated_stats["summarize_completion_tokens"],
+                    "total_tokens": aggregated_stats["summarize_total_tokens"],
                 },
-                "stage_timings": {
-                    "compress": self.token_stats.get("stage_compress_time", 0.0),
-                    "segment": self.token_stats.get("stage_segment_time", 0.0),
-                    "llm_extract": self.token_stats.get("stage_llm_extract_time", 0.0),
-                    "db_insert": self.token_stats.get("stage_db_insert_time", 0.0),
-                }
+            },
+            "embedding": {
+                "total_calls": embedder_stats["total_calls"],
+                "total_tokens": embedder_stats["total_tokens"],
+                "note": "Includes topic segmentation + memory indexing. Local models show None for tokens."
+            },
+            "stage_timings": {
+                "compress": aggregated_stats["stage_compress_time"],
+                "segment": aggregated_stats["stage_segment_time"],
+                "llm_extract": aggregated_stats["stage_llm_extract_time"],
+                "db_insert": aggregated_stats["stage_db_insert_time"],
             }
+        }
         
         return stats
     
     def reset_token_statistics(self):
-        with self._token_stats_lock:
-            self.token_stats = {
-                "add_memory_calls": 0,
-                "add_memory_prompt_tokens": 0,
-                "add_memory_completion_tokens": 0,
-                "add_memory_total_tokens": 0,
-                "add_memory_time": 0.0,
-                "update_calls": 0,
-                "update_prompt_tokens": 0,
-                "update_completion_tokens": 0,
-                "update_total_tokens": 0,
-                "update_time": 0.0,
-                "summarize_calls": 0,
-                "summarize_prompt_tokens": 0,
-                "summarize_completion_tokens": 0,
-                "summarize_total_tokens": 0,
-                "summarize_time": 0.0,
-                "embedding_calls": 0,
-                "embedding_total_tokens": 0,
-                "embedding_time": 0.0,
-                "stage_compress_time": 0.0,
-                "stage_segment_time": 0.0,
-                "stage_llm_extract_time": 0.0,
-                "stage_db_insert_time": 0.0,
-                "add_memory_errors": 0,
-                "update_errors": 0,
-                "summarize_errors": 0,
-            }
+        with self._tenants_lock:
+            for tenant in self._tenants.values():
+                with tenant.lock:
+                    tenant.token_stats = {
+                        "add_memory_calls": 0, "add_memory_prompt_tokens": 0, "add_memory_completion_tokens": 0,
+                        "add_memory_total_tokens": 0, "add_memory_time": 0.0, "update_calls": 0,
+                        "update_prompt_tokens": 0, "update_completion_tokens": 0, "update_total_tokens": 0,
+                        "update_time": 0.0, "summarize_calls": 0, "summarize_prompt_tokens": 0,
+                        "summarize_completion_tokens": 0, "summarize_total_tokens": 0, "summarize_time": 0.0,
+                        "embedding_calls": 0, "embedding_total_tokens": 0, "embedding_time": 0.0,
+                        "stage_compress_time": 0.0, "stage_segment_time": 0.0, "stage_llm_extract_time": 0.0,
+                        "stage_db_insert_time": 0.0, "add_memory_errors": 0, "update_errors": 0,
+                        "summarize_errors": 0,
+                    }
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'reset_stats'):
             self.text_embedder.reset_stats()
     
