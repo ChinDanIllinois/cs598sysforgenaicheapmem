@@ -55,7 +55,7 @@ class MemoryManagerFactory:
             manager = manager_class(**manager_kwargs)
             
             # Setup batching if enabled
-            if config.configs and config.configs.llm_batch_size > 1:
+            if config.configs and (config.configs.llm_batch_size > 1 or getattr(config.configs, "vllm_adaptive_shaping", False)):
                 logger = logging.getLogger("LightMem")
                 batch_manager = None
                 
@@ -66,7 +66,9 @@ class MemoryManagerFactory:
                         batch_size=config.configs.llm_batch_size,
                         timeout=config.configs.llm_batch_timeout,
                         api_key=config.configs.api_key or "EMPTY",
-                        logger=logger
+                        logger=logger,
+                        adaptive_shaping=getattr(config.configs, "vllm_adaptive_shaping", False),
+                        metrics_url=getattr(config.configs, "vllm_metrics_url", None)
                     )
                 elif model_name == "gemini":
                     # Gemini needs the client from the manager
