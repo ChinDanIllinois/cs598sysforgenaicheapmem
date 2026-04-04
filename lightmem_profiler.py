@@ -591,12 +591,18 @@ async def worker(worker_id, concurrency, stop_event):
             # Respect RPM throttle
             await rate_limiter.wait()
 
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 memory.add_memory,
                 messages=messages,
+                user_id=f"worker_{worker_id}",
                 force_segment=True,
                 force_extract=True,
             )
+            
+            # Wait for backend extraction worker to finish if enqueued
+            if isinstance(result, dict) and "extraction_future" in result:
+                await asyncio.wrap_future(result["extraction_future"])
+
             duration = time.perf_counter() - start_t
             with metrics_lock:
                 total_writes  += 1
