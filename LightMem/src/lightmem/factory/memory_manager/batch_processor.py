@@ -5,9 +5,8 @@ import time
 import uuid
 import concurrent.futures
 import requests
-from typing import List, Dict, Any, Optional
-from google import genai
-from google.genai import types
+from typing import List, Dict, Any, Optional, Union
+from enum import Enum
 from .batch_manager import BatchManager
 
 class GeminiBatchProcessor(BatchManager):
@@ -235,8 +234,73 @@ class GeminiBatchProcessor(BatchManager):
         if self._monitor_thread.is_alive():
             self._monitor_thread.join()
 
+    def stop(self):
+        self._stop_event.set()
+        if self._monitor_thread.is_alive():
+            self._monitor_thread.join()
+
+class VllmState(Enum):
+    HUNGRY = "hungry"
+    BALANCED = "balanced"
+    COMPUTE_BOUND = "compute_bound"
+    MEMORY_BOUND = "memory_bound"
+
+class VllmStateMonitor:
+    def __init__(self, metrics_url: str, logger: Any, poll_interval: float = 2.0):
+        self.metrics_url = metrics_url
+        self.logger = logger
+        self.poll_interval = poll_interval
+        
+        self.state = VllmState.BALANCED
+        self.kv_cache_usage = 0.0
+        self.num_waiting = 0
+        self.num_running = 0
+        
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def _poll_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                response = requests.get(self.metrics_url, timeout=2)
+                if response.status_code == 200:
+                    text = response.text
+                    self._parse_metrics(text)
+                    self._update_state()
+            except Exception as e:
+                self.logger.debug(f"Error polling vLLM metrics: {e}")
+            
+            time.sleep(self.poll_interval)
+
+    def _parse_metrics(self, text: str):
+        for line in text.splitlines():
+            if line.startswith("vllm:kv_cache_usage_perc") or line.startswith("vllm_kv_cache_usage_perc"):
+                self.kv_cache_usage = float(line.split()[-1])
+            elif line.startswith("vllm:num_requests_waiting") or line.startswith("vllm_num_requests_waiting"):
+                self.num_waiting = int(float(line.split()[-1]))
+            elif line.startswith("vllm:num_requests_running") or line.startswith("vllm_num_requests_running"):
+                self.num_running = int(float(line.split()[-1]))
+
+    def _update_state(self):
+        if self.kv_cache_usage > 0.85:
+            self.state = VllmState.MEMORY_BOUND
+        elif self.num_waiting > 0:
+            self.state = VllmState.COMPUTE_BOUND
+        elif self.num_running < 2:
+            self.state = VllmState.HUNGRY
+        else:
+            self.state = VllmState.BALANCED
+            
+    def get_state(self) -> VllmState:
+        return self.state
+
+    def stop(self):
+        self._stop_event.set()
+
 class VllmBatchProcessor(BatchManager):
-    def __init__(self, base_url: str, model: str, batch_size: int, timeout: int, api_key: str, logger: Any):
+    def __init__(self, base_url: str, model: str, batch_size: int, timeout: int, api_key: str, logger: Any, 
+                 adaptive_shaping: bool = False, metrics_url: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         if not self.base_url.endswith("/v1"):
             self.batch_url = f"{self.base_url}/v1/chat/completions/batch"
@@ -248,7 +312,14 @@ class VllmBatchProcessor(BatchManager):
         self.timeout = timeout
         self.api_key = api_key
         self.logger = logger
+        self.adaptive_shaping = adaptive_shaping
         
+        self.state_monitor = None
+        if self.adaptive_shaping:
+            m_url = metrics_url or f"{self.base_url.replace('/v1', '')}/metrics"
+            self.state_monitor = VllmStateMonitor(m_url, logger)
+            self.logger.info(f"Initialized VllmStateMonitor with url: {m_url}")
+
         self._buffer: List[List[Dict[str, str]]] = []
         self._configs: List[Dict[str, Any]] = []
         self._futures: List[concurrent.futures.Future] = []
@@ -262,14 +333,41 @@ class VllmBatchProcessor(BatchManager):
     def add_request(self, messages: List[Dict[str, str]], config: Optional[Dict[str, Any]] = None) -> concurrent.futures.Future:
         future = concurrent.futures.Future()
         
+        effective_state = VllmState.BALANCED
+        if self.state_monitor:
+            effective_state = self.state_monitor.get_state()
+
+        # Admission Control: Smoothing arrivals in Memory Bound or Balanced states
+        if effective_state == VllmState.MEMORY_BOUND:
+            # Random jitter between 20ms and 100ms to disperse arrivals
+            time.sleep(0.02 + 0.08 * (uuid.uuid4().int / 2**128))
+        elif effective_state == VllmState.BALANCED:
+            # Tiny jitter between 5ms and 15ms
+            time.sleep(0.005 + 0.01 * (uuid.uuid4().int / 2**128))
+
         with self._lock:
             self._buffer.append(messages)
             self._configs.append(config or {})
             self._futures.append(future)
-            self.logger.debug(f"Added request to vLLM batch buffer. Current size: {len(self._buffer)}")
             
-            if len(self._buffer) >= self.batch_size:
-                self.logger.info(f"Batch size {self.batch_size} reached. Flushing...")
+            # Adaptive Target Batch Size Calculation
+            # This is the "internal" batch size we aim for before flushing
+            if effective_state == VllmState.HUNGRY:
+                target_batch_size = 1 # Feed the idle engine instantly 
+            elif effective_state == VllmState.COMPUTE_BOUND:
+                # If server has a backlog, coalesce more into one HTTP payload.
+                # Heuristic: 1/4 of wait queue but bounded by safety max_batch_size
+                num_waiting = getattr(self.state_monitor, 'num_waiting', 0)
+                target_batch_size = min(self.batch_size, (num_waiting // 4) + 2)
+                target_batch_size = max(target_batch_size, 4)
+            else: # BALANCED or MEMORY_BOUND
+                target_batch_size = 1 # Immediate dispersion to avoid bursts
+            
+            # The current buffer size vs our dynamic target (constrained by user safety cap)
+            should_flush = len(self._buffer) >= target_batch_size
+            
+            if should_flush:
+                self.logger.debug(f"Flushing vLLM batch (state={effective_state.value}, target={target_batch_size}). Buffer size: {len(self._buffer)}")
                 self._flush()
             elif len(self._buffer) == 1:
                 self._last_flush_time = time.time()
@@ -278,10 +376,31 @@ class VllmBatchProcessor(BatchManager):
 
     def _monitor_loop(self):
         while not self._stop_event.is_set():
-            time.sleep(1)
+            time.sleep(0.1) # Higher frequency for micro-batching checks
             with self._lock:
-                if self._buffer and (time.time() - self._last_flush_time >= self.timeout):
-                    self.logger.info(f"Batch timeout {self.timeout}s reached. Flushing {len(self._buffer)} requests...")
+                if not self._buffer:
+                    continue
+                    
+                elapsed = time.time() - self._last_flush_time
+                
+                effective_state = VllmState.BALANCED
+                if self.state_monitor:
+                    effective_state = self.state_monitor.get_state()
+
+                # Micro-batching window based on state
+                if effective_state == VllmState.COMPUTE_BOUND:
+                    # In compute-bound state, wait just long enough to pack more into HTTP
+                    # but never more than 30ms to maintain token-step flexibility
+                    current_timeout = 0.03
+                elif effective_state == VllmState.HUNGRY:
+                    current_timeout = 0.0 # Instant feed
+                else:
+                    # Smoothing: use the fallback timeout (e.g. 5s) but the add_request
+                    # usually flushes BALANCED/MEMORY states immediately with jitter
+                    current_timeout = self.timeout 
+
+                if elapsed >= current_timeout:
+                    self.logger.info(f"VllmRequestShaper: Adaptive flush (state={effective_state.value}) after {elapsed:.3f}s. Timeout limit: {current_timeout:.3f}s")
                     self._flush()
 
     def _flush(self):
@@ -367,5 +486,7 @@ class VllmBatchProcessor(BatchManager):
 
     def stop(self):
         self._stop_event.set()
+        if self.state_monitor:
+            self.state_monitor.stop()
         if self._monitor_thread.is_alive():
             self._monitor_thread.join()
