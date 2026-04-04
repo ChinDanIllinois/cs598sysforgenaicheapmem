@@ -52,12 +52,18 @@ last_metrics = {
     'reg_count': 0, 'batch_count': 0
 }
 
-def get_metric_with_labels(name, labels, text):
-    """Helper to extract Prometheus metrics with specific labels."""
-    pattern = name + r'\{'
-    for k, v in labels.items():
-        pattern += r'.*?' + k + r'="' + v + r'"'
-    pattern += r'.*?\} ([\d.e+-]+)'
+def get_metric_value(name, labels, text):
+    """Robust extractor for Prometheus metrics with optional labels."""
+    # Build label pattern
+    if labels:
+        label_str = r'\{'
+        for k, v in labels.items():
+            label_str += rf'.*?{k}="{v}"'
+        label_str += r'.*?\}'
+    else:
+        label_str = r'(?:\{.*?\})?'
+    
+    pattern = rf'{name}{label_str}\s+([\d.e+-]+)'
     match = re.search(pattern, text)
     if match:
         return float(match.group(1))
@@ -73,30 +79,30 @@ def parse_vllm_metrics():
         text = response.text
         metrics = {}
         
-        # Regex patterns for key vLLM engine metrics
-        engine_patterns = {
-            'running': r'vllm:num_requests_running ([\d.]+)',
-            'waiting': r'vllm:num_requests_waiting ([\d.]+)',
-            'swapped': r'vllm:num_requests_swapped ([\d.]+)',
-            'gpu_cache': r'vllm:gpu_cache_usage_perc ([\d.]+)',
-            'cpu_cache': r'vllm:cpu_cache_usage_perc ([\d.]+)',
-            'prompt_tokens_total': r'vllm:prompt_tokens_total ([\d.]+)',
-            'generation_tokens_total': r'vllm:generation_tokens_total ([\d.]+)',
-        }
+        # Core vLLM engine metrics
+        metrics['running'] = get_metric_value("vllm:num_requests_running", {}, text)
+        metrics['waiting'] = get_metric_value("vllm:num_requests_waiting", {}, text)
+        metrics['swapped'] = get_metric_value("vllm:num_requests_swapped", {}, text)
         
-        for key, pattern in engine_patterns.items():
-            match = re.search(pattern, text)
-            metrics[key] = float(match.group(1)) if match else 0.0
+        # vLLM changed gpu_cache_usage_perc to kv_cache_usage_perc in recent versions
+        metrics['gpu_cache'] = get_metric_value("vllm:kv_cache_usage_perc", {}, text)
+        if metrics['gpu_cache'] == 0:
+            metrics['gpu_cache'] = get_metric_value("vllm:gpu_cache_usage_perc", {}, text)
+            
+        metrics['cpu_cache'] = get_metric_value("vllm:cpu_cache_usage_perc", {}, text)
+        
+        metrics['prompt_tokens_total'] = get_metric_value("vllm:prompt_tokens_total", {}, text)
+        metrics['generation_tokens_total'] = get_metric_value("vllm:generation_tokens_total", {}, text)
         
         # HTTP Handler Metrics (Regular vs Batch)
-        metrics['reg_count'] = get_metric_with_labels("http_requests_total", {"handler": "/v1/chat/completions", "status": "2xx"}, text)
-        metrics['batch_count'] = get_metric_with_labels("http_requests_total", {"handler": "/v1/chat/completions/batch", "status": "2xx"}, text)
+        metrics['reg_count'] = get_metric_value("http_requests_total", {"handler": "/v1/chat/completions", "status": "2xx"}, text)
+        metrics['batch_count'] = get_metric_value("http_requests_total", {"handler": "/v1/chat/completions/batch", "status": "2xx"}, text)
         
-        metrics['reg_lat_sum'] = get_metric_with_labels("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions"}, text)
-        metrics['reg_lat_count'] = get_metric_with_labels("http_request_duration_seconds_count", {"handler": "/v1/chat/completions"}, text)
+        metrics['reg_lat_sum'] = get_metric_value("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions"}, text)
+        metrics['reg_lat_count'] = get_metric_value("http_request_duration_seconds_count", {"handler": "/v1/chat/completions"}, text)
         
-        metrics['batch_lat_sum'] = get_metric_with_labels("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions/batch"}, text)
-        metrics['batch_lat_count'] = get_metric_with_labels("http_request_duration_seconds_count", {"handler": "/v1/chat/completions/batch"}, text)
+        metrics['batch_lat_sum'] = get_metric_value("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions/batch"}, text)
+        metrics['batch_lat_count'] = get_metric_value("http_request_duration_seconds_count", {"handler": "/v1/chat/completions/batch"}, text)
                 
         return metrics
     except Exception as e:
