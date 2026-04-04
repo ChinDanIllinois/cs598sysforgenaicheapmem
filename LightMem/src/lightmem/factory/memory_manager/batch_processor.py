@@ -7,6 +7,7 @@ import concurrent.futures
 import requests
 from typing import List, Dict, Any, Optional, Union
 from enum import Enum
+from google import genai
 from .batch_manager import BatchManager
 
 try:
