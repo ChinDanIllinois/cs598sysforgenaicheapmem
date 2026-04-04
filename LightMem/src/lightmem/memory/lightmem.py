@@ -345,8 +345,8 @@ class LightMemory:
             self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
             return result
 
-        self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
-        self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
+            self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
+            self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
 
         t_llm_start = time.perf_counter()
         extract_trigger_num, extract_list = self.shortmem_buffer_manager.add_segments(
