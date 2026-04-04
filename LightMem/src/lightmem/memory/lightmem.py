@@ -386,6 +386,7 @@ class LightMemory:
         
         # We don't block. The metrics will be updated by the batch_worker asynchronously.
         result["async_job_enqueued"] = True
+        result["extraction_future"] = future
         return result
 
     def online_update(self, memory_list: List):
