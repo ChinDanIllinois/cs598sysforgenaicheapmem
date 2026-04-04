@@ -169,6 +169,7 @@ class LightMemory:
             "summarize_errors": 0,
         }
         self._token_stats_lock = threading.Lock()
+        self._buffer_lock = threading.Lock()
         self.logger.info("Token statistics tracking initialized")
         
         self.config = config
@@ -356,8 +357,8 @@ class LightMemory:
             self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
             return result # TODO
 
-        self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
-        self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
+            self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
+            self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
 
         extract_trigger_num, extract_list = tenant.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
 
