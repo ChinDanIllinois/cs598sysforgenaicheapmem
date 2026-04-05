@@ -3,6 +3,7 @@ LightMem Multi-Tenant Load Test Harness
 Simulates a realistic multi-tenant workload using LongMemEval dataset.
 Events (historical session archiving and queries) are played back according to their timestamps.
 Synced with configuration options from lightmem_profiler.py.
+Includes a live Dash dashboard for real-time monitoring.
 """
 
 import argparse
@@ -25,11 +26,16 @@ import numpy as np
 import pandas as pd
 from lightmem.memory.lightmem import LightMemory
 
-# Suppress Logs
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
+import plotly.graph_objs as go
 import flask.cli
+
+# Suppress Logs
 flask.cli.show_server_banner = lambda *args: None
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 logging.getLogger('flask').setLevel(logging.ERROR)
+logging.getLogger('dash').setLevel(logging.ERROR)
 
 dotenv.load_dotenv()
 
@@ -56,304 +62,7 @@ class AsyncRateLimiter:
             self.last_call = time.perf_counter()
 
 # ============================================================
-# CLI ARGUMENT PARSING
-# ============================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="LightMem Multi-Tenant Multi-User Load Test simulation.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    
-    # Provider & Backend Config (Synced with lightmem_profiler.py)
-    parser.add_argument(
-        "--provider",
-        required=True,
-        choices=["ollama", "gemini", "openai", "vllm", "mock"],
-        help="LLM backend provider to use for memory management.",
-    )
-    parser.add_argument(
-        "--llm-batch-size",
-        type=int,
-        default=1,
-        help="LLM batch size for compatible providers (e.g., vllm). Default: 1 (no batching).",
-    )
-    parser.add_argument(
-        "--llm-batch-timeout",
-        type=int,
-        default=10,
-        help="LLM batch timeout in seconds. Default: 10.",
-    )
-    parser.add_argument(
-        "--vllm-adaptive-shaping",
-        action="store_true",
-        help="Enable adaptive request shaping for vLLM (monitors engine metrics).",
-    )
-    parser.add_argument(
-        "--vllm-metrics-url",
-        type=str,
-        default="",
-        help="Custom metrics URL for vLLM (defaults to VLLM_BASE_URL/metrics).",
-    )
-    parser.add_argument(
-        "--rpm",
-        type=float,
-        default=0,
-        metavar="RPM",
-        help="Global rate limit in Requests Per Minute (default: 0 = unlimited).",
-    )
-    
-    # Multi-Tenant Simulation Control
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        default="",
-        help="Path to LongMemEval dataset JSON. (Defaults to DATA_PATH env var).",
-    )
-    parser.add_argument(
-        "--time-scale",
-        type=float,
-        default=3600.0,
-        help="1 unit of dataset time (seconds) = X real-time seconds. Ignored if --target-duration is set.",
-    )
-    parser.add_argument(
-        "--target-duration",
-        type=float,
-        default=0,
-        help="Target total run time in seconds. If set, --time-scale is automatically calculated.",
-    )
-    parser.add_argument(
-        "--max-users",
-        type=int,
-        default=50,
-        help="Maximum number of users (tenants) to simulate.",
-    )
-    parser.add_argument(
-        "--max-sessions-per-user",
-        type=int,
-        default=10,
-        help="Maximum history sessions to load per user.",
-    )
-    parser.add_argument(
-        "--concurrency-limit",
-        type=int,
-        default=10,
-        help="Max simultaneous backend tasks (semaphore limit).",
-    )
-    parser.add_argument(
-        "--skip-history",
-        action="store_true",
-        help="Only send queries (no background archiving).",
-    )
-    parser.add_argument(
-        "--skip-queries",
-        action="store_true",
-        help="Only perform archiving (no retrieval queries).",
-    )
-    
-    # Dataset Slicing
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default="",
-        help="Start date for slice (YYYY-MM-DD). If empty, starts from beginning.",
-    )
-    parser.add_argument(
-        "--end-date",
-        type=str,
-        default="",
-        help="End date for slice (YYYY-MM-DD). If empty, no end bound.",
-    )
-    parser.add_argument(
-        "--max-events",
-        type=int,
-        default=0,
-        help="Maximum total events to include in the simulation.",
-    )
-    
-    # Metadata & Logging
-    parser.add_argument(
-        "--run-name",
-        type=str,
-        default="multitenant_run",
-        help="Label for this run, included in the CSV filename.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8052,
-        help="Dashboard port (Not yet fully implemented for multitenant).",
-    )
-    
-    return parser.parse_args()
-
-# ============================================================
-# ENV VALIDATION (Synced with lightmem_profiler.py)
-# ============================================================
-
-_SHARED_ENV_VARS = {
-    "LLMLINGUA_MODEL_PATH": "Path to LLMLingua-2 model weights.",
-    "EMBEDDING_MODEL_PATH": "Path to HuggingFace embedding model.",
-    "QDRANT_DATA_DIR":      "Directory for Qdrant persistence.",
-}
-
-_PROVIDER_ENV_VARS = {
-    "ollama": [("OLLAMA_MODEL_NAME", "Model name"), ("OLLAMA_HOST", "Host URL")],
-    "gemini": [("GEMINI_MODEL_NAME", "Model name"), ("GEMINI_API_KEY", "API Key")],
-    "openai": [("OPENAI_MODEL_NAME", "Model name"), ("OPENAI_API_KEY", "API Key")],
-    "vllm":   [("VLLM_MODEL_NAME", "Model name"), ("VLLM_BASE_URL", "Base URL")],
-    "mock":   [],
-}
-
-def validate_env(provider: str) -> None:
-    missing = []
-    for var, desc in _SHARED_ENV_VARS.items():
-        if not os.getenv(var): missing.append(var)
-    for var, desc in _PROVIDER_ENV_VARS[provider]:
-        if not os.getenv(var): missing.append(var)
-    if missing:
-        print(f"ERROR: Missing environment variables: {', '.join(missing)}")
-        sys.exit(1)
-
-# ============================================================
-# BACKEND BUILDERS
-# ============================================================
-
-def _memory_manager_config_ollama(args) -> dict:
-    return {
-        "model_name": "ollama",
-        "configs": {
-            "model": os.getenv("OLLAMA_MODEL_NAME"),
-            "host":  os.getenv("OLLAMA_HOST"),
-            "max_tokens": 16384,
-        },
-    }
-
-def _memory_manager_config_gemini(args) -> dict:
-    return {
-        "model_name": "gemini",
-        "configs": {
-            "model":      os.getenv("GEMINI_MODEL_NAME"),
-            "api_key":    os.getenv("GEMINI_API_KEY"),
-            "max_tokens": 16384,
-        },
-    }
-
-def _memory_manager_config_vllm(args) -> dict:
-    return {
-        "model_name": "vllm",
-        "configs": {
-            "model":      os.getenv("VLLM_MODEL_NAME"),
-            "api_key":    os.getenv("VLLM_API_KEY", "EMPTY"),
-            "max_tokens": 16384,
-            "vllm_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
-            "llm_batch_size": args.llm_batch_size,
-            "llm_batch_timeout": args.llm_batch_timeout,
-            "vllm_adaptive_shaping": args.vllm_adaptive_shaping,
-            "vllm_metrics_url": args.vllm_metrics_url if args.vllm_metrics_url else None,
-        },
-    }
-
-def _memory_manager_config_openai(args) -> dict:
-    return {
-        "model_name": "openai",
-        "configs": {
-            "model":      os.getenv("OPENAI_MODEL_NAME"),
-            "api_key":    os.getenv("OPENAI_API_KEY"),
-            "max_tokens": 16384,
-        },
-    }
-
-def _memory_manager_config_mock(args) -> dict:
-    return {
-        "model_name": "mock",
-        "configs": {"model": "mock-model"},
-    }
-
-_BUILDERS = {
-    "ollama": _memory_manager_config_ollama,
-    "gemini": _memory_manager_config_gemini,
-    "openai": _memory_manager_config_openai,
-    "vllm":   _memory_manager_config_vllm,
-    "mock":   _memory_manager_config_mock,
-}
-
-# ============================================================
-# DATA PREPARATION
-# ============================================================
-
-def parse_date(date_str: str) -> float:
-    try:
-        parts = date_str.split(" ")
-        clean_str = f"{parts[0]} {parts[2]}" 
-        dt = datetime.datetime.strptime(clean_str, "%Y/%m/%d %H:%M")
-        return dt.timestamp()
-    except:
-        return time.time()
-
-def load_events(data_path: str, args):
-    if not data_path or not os.path.exists(data_path):
-        print(f"ERROR: Data path {data_path} not found.")
-        return []
-
-    with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Date Bound Parsing
-    start_ts = 0.0
-    end_ts = float("inf")
-    if args.start_date:
-        start_ts = datetime.datetime.strptime(args.start_date, "%Y-%m-%d").timestamp()
-    if args.end_date:
-        end_ts = datetime.datetime.strptime(args.end_date, "%Y-%m-%d").timestamp()
-
-    all_events = []
-    for item in data[:args.max_users]:
-        user_id = item["question_id"]
-        # History
-        if not args.skip_history:
-            h_sessions = item.get("haystack_sessions", [])
-            h_dates = item.get("haystack_dates", [])
-            for session, date_str in zip(h_sessions[:args.max_sessions_per_user], h_dates[:args.max_sessions_per_user]):
-                ts = parse_date(date_str)
-                if start_ts <= ts <= end_ts:
-                    # Tag every message with the timestamp required by LightMem
-                    tagged_session = []
-                    for msg in session:
-                        msg_copy = dict(msg)
-                        msg_copy["time_stamp"] = date_str
-                        tagged_session.append(msg_copy)
-                        
-                    all_events.append({
-                        "ts": ts,
-                        "type": "archive",
-                        "user_id": user_id,
-                        "content": tagged_session
-                    })
-        
-        # Query
-        if not args.skip_queries:
-            q_date = item.get("question_date")
-            if q_date:
-                ts = parse_date(q_date)
-                if start_ts <= ts <= end_ts:
-                    all_events.append({
-                        "ts": ts,
-                        "type": "query",
-                        "user_id": user_id,
-                        "content": item["question"]
-                    })
-            
-    all_events.sort(key=lambda x: x["ts"])
-    
-    # Cap total events if requested
-    if args.max_events > 0:
-        all_events = all_events[:args.max_events]
-        
-    return all_events
-
-# ============================================================
-# SIMULATION ENGINE
+# GLOBAL STATE & METRICS
 # ============================================================
 
 class LoadTestMetrics:
@@ -363,6 +72,7 @@ class LoadTestMetrics:
         self.total_completed = 0
         self.total_errors = 0
         self.start_time = time.time()
+        self.simulation_finished = False
         self.lock = threading.Lock()
 
     def record(self, event_type, user_id, latency, status="success", stage_timings=None):
@@ -383,7 +93,8 @@ class LoadTestMetrics:
                 self.total_errors += 1
 
     def save(self, filename_base):
-        df = pd.DataFrame(self.results)
+        with self.lock:
+            df = pd.DataFrame(self.results)
         df.to_csv(f"{filename_base}.csv", index=False)
         
         if self.throughput_records:
@@ -393,6 +104,253 @@ class LoadTestMetrics:
             
         print(f"Raw event metrics saved to {filename_base}.csv")
 
+GLOBAL_METRICS = LoadTestMetrics()
+
+# ============================================================
+# CLI ARGUMENT PARSING
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="LightMem Multi-Tenant Multi-User Load Test simulation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    
+    # Provider & Backend Config (Synced with lightmem_profiler.py)
+    parser.add_argument(
+        "--provider",
+        required=True,
+        choices=["ollama", "gemini", "openai", "vllm", "mock"],
+        help="LLM backend provider.",
+    )
+    parser.add_argument("--llm-batch-size", type=int, default=1)
+    parser.add_argument("--llm-batch-timeout", type=int, default=10)
+    parser.add_argument("--vllm-adaptive-shaping", action="store_true")
+    parser.add_argument("--vllm-metrics-url", type=str, default="")
+    parser.add_argument("--rpm", type=float, default=0.0, metavar="RPM")
+    
+    # Multi-Tenant Simulation Control
+    parser.add_argument("--data-path", type=str, default="")
+    parser.add_argument("--time-scale", type=float, default=3600.0)
+    parser.add_argument("--target-duration", type=float, default=0)
+    parser.add_argument("--max-users", type=int, default=50)
+    parser.add_argument("--max-sessions-per-user", type=int, default=10)
+    parser.add_argument("--concurrency-limit", type=int, default=10)
+    parser.add_argument("--skip-history", action="store_true")
+    parser.add_argument("--skip-queries", action="store_true")
+    
+    # Dataset Slicing
+    parser.add_argument("--start-date", type=str, default="")
+    parser.add_argument("--end-date", type=str, default="")
+    parser.add_argument("--max-events", type=int, default=0)
+    
+    # Metadata & Logging
+    parser.add_argument("--run-name", type=str, default="multitenant_run")
+    parser.add_argument("--port", type=int, default=8052, help="Dashboard port.")
+    
+    return parser.parse_args()
+
+# ============================================================
+# DASHBOARD — DESIGN SYSTEM
+# ============================================================
+
+BG         = "#0f1117"
+CARD_BG    = "#1a1d27"
+BORDER     = "#2a2d3e"
+ACCENT     = "#6366f1"
+ACCENT2    = "#22d3ee"
+ACCENT3    = "#f59e0b"
+ACCENT4    = "#10b981"
+ACCENT_ERR = "#ef4444"
+TEXT       = "#e2e8f0"
+TEXT_DIM   = "#64748b"
+
+PLOT_LAYOUT = dict(
+    paper_bgcolor=CARD_BG,
+    plot_bgcolor=CARD_BG,
+    font=dict(color=TEXT, family="Inter, sans-serif", size=12),
+    margin=dict(l=48, r=16, t=44, b=40),
+    xaxis=dict(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True),
+    yaxis=dict(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True),
+    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor=BORDER),
+)
+
+def make_scatter(x, y, color, name=None, mode="lines", dash=None, fill=None):
+    kw = dict(x=x, y=y, mode=mode, name=name or "", line=dict(color=color, width=2))
+    if dash: kw["line"]["dash"] = dash
+    if fill: kw["fill"] = fill
+    return go.Scatter(**kw)
+
+def card_graph(gid):
+    return dcc.Graph(id=gid, config={"displayModeBar": False}, style={"borderRadius": "12px", "overflow": "hidden"})
+
+def section(title, graphs, ncols=2):
+    return html.Div([
+        html.H3(title, style={"color": ACCENT2, "fontSize": "11px", "fontWeight": "700", "letterSpacing": "0.1em", "textTransform": "uppercase", "margin": "0 0 12px 2px"}),
+        html.Div(graphs, style={"display": "grid", "gridTemplateColumns": f"repeat({ncols}, 1fr)", "gap": "16px"}),
+    ], style={"marginBottom": "36px"})
+
+# ============================================================
+# DASHBOARD SETUP
+# ============================================================
+
+app = Dash(__name__)
+app.title = "LightMem Multi-Tenant Dashboard"
+
+app.layout = html.Div([
+    # Header
+    html.Div([
+        html.Div([
+            html.Span("🏢", style={"fontSize": "26px", "marginRight": "12px"}),
+            html.Div([
+                html.H1("Multi-Tenant Load Test", style={"margin": 0, "fontSize": "20px", "color": TEXT}),
+                html.P(id="sim-info", style={"margin": 0, "color": TEXT_DIM, "fontSize": "12px"}),
+            ]),
+        ], style={"display": "flex", "alignItems": "center"}),
+        html.Div(id="status_badge"),
+    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "padding": "18px 28px", "background": CARD_BG, "borderBottom": f"1px solid {BORDER}", "marginBottom": "28px"}),
+
+    # Body
+    html.Div([
+        section("Real-Time Load Performance", [
+            card_graph("live_throughput"),
+            card_graph("live_latency"),
+        ], ncols=2),
+        section("System Mix & Scaling", [
+            card_graph("event_mix"),
+            card_graph("active_users"),
+        ], ncols=2),
+        section("Pipeline Breakdown", [
+            card_graph("stage_breakdown"),
+        ], ncols=1),
+    ], style={"padding": "0 28px 40px"}),
+
+    dcc.Interval(id="interval", interval=2000, n_intervals=0),
+], style={"backgroundColor": BG, "minHeight": "100vh", "fontFamily": "Inter, sans-serif"})
+
+@app.callback(
+    [
+        Output("live_throughput", "figure"),
+        Output("live_latency", "figure"),
+        Output("event_mix", "figure"),
+        Output("active_users", "figure"),
+        Output("stage_breakdown", "figure"),
+        Output("status_badge", "children"),
+        Output("sim-info", "children"),
+    ],
+    [Input("interval", "n_intervals")]
+)
+def update_metrics(n):
+    with GLOBAL_METRICS.lock:
+        data = list(GLOBAL_METRICS.results)
+        tput_hist = list(GLOBAL_METRICS.throughput_records)
+        finished = GLOBAL_METRICS.simulation_finished
+        total_comp = GLOBAL_METRICS.total_completed
+
+    # 1. Throughput Figure
+    fig_tput = go.Figure()
+    if tput_hist:
+        tx = [r["elapsed_sec"] for r in tput_hist]
+        ty = [r["throughput_eps"] for r in tput_hist]
+        fig_tput.add_trace(make_scatter(tx, ty, ACCENT, "EPS", fill="tozeroy"))
+    fig_tput.update_layout(title="Throughput (Events Per Second)", **PLOT_LAYOUT)
+
+    # 2. Latency Figure (Rolling P50/P99)
+    fig_lat = go.Figure()
+    if data:
+        # Group by 5s windows for percentiles
+        df = pd.DataFrame(data)
+        df["win"] = (df["wall_time"] // 5) * 5
+        win_groups = df.groupby("win")["latency"].agg([lambda x: np.percentile(x, 50), lambda x: np.percentile(x, 95), lambda x: np.percentile(x, 99)]).reset_index()
+        win_groups.columns = ["win", "p50", "p95", "p99"]
+        
+        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p50"], ACCENT2, "P50 Latency"))
+        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p95"], ACCENT3, "P95 Latency", dash="dot"))
+        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p99"], ACCENT_ERR, "P99 Latency", dash="dash"))
+    fig_lat.update_layout(title="Latency Trends (P50/P95/P99)", **PLOT_LAYOUT)
+
+    # 3. Request Mix (Archive vs Query)
+    fig_mix = go.Figure()
+    if data:
+        df = pd.DataFrame(data)
+        df["win"] = (df["wall_time"] // 5) * 5
+        mix = df.groupby(["win", "type"]).size().unstack(fill_value=0).reset_index()
+        if "archive" in mix.columns:
+            fig_mix.add_trace(make_scatter(mix["win"], mix["archive"], ACCENT, "Archives (Writes)", fill="tozeroy"))
+        if "query" in mix.columns:
+            fig_mix.add_trace(make_scatter(mix["win"], mix["query"], ACCENT2, "Queries (Reads)", fill="tonexty"))
+    fig_mix.update_layout(title="Request Mix (Writes vs Reads)", **PLOT_LAYOUT)
+
+    # 4. Active Users (Cumulative)
+    fig_users = go.Figure()
+    if data:
+        df = pd.DataFrame(data)
+        df["win"] = (df["wall_time"] // 5) * 5
+        unique_users = []
+        user_timeline = df.sort_values("wall_time")
+        seen = set()
+        current_win = -1
+        for _, r in user_timeline.iterrows():
+            seen.add(r["user_id"])
+            w = (r["wall_time"] // 5) * 5
+            if w > current_win:
+                unique_users.append((w, len(seen)))
+                current_win = w
+        ux, uy = zip(*unique_users) if unique_users else ([], [])
+        fig_users.add_trace(make_scatter(ux, uy, ACCENT4, "Total Unique Tenants", fill="tozeroy"))
+    fig_users.update_layout(title="Tenant Saturation (Unique Users)", **PLOT_LAYOUT)
+
+    # 5. Pipeline Stages
+    fig_sb = go.Figure()
+    if data:
+        df = pd.DataFrame(data)
+        stages = [("stage_compress", "Compress", ACCENT), ("stage_segment", "Segment", ACCENT2), ("stage_llm_extract", "LLM Extract", ACCENT3), ("stage_db_insert", "DB Insert", ACCENT4)]
+        for k, label, color in stages:
+            if k in df.columns:
+                fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
+    fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
+
+    # Status Bundle
+    status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
+    info = f"Total Events: {total_comp} | Multi-Tenant Simulation v1.0"
+
+    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, status, info
+
+# ============================================================
+# CORE LOGIC (Rest of script)
+# ============================================================
+
+def parse_date(date_str: str) -> float:
+    try:
+        parts = date_str.split(" ")
+        clean_str = f"{parts[0]} {parts[2]}" 
+        dt = datetime.datetime.strptime(clean_str, "%Y/%m/%d %H:%M")
+        return dt.timestamp()
+    except: return time.time()
+
+def load_events(data_path: str, args):
+    if not data_path or not os.path.exists(data_path): return []
+    with open(data_path, "r") as f: data = json.load(f)
+    start_ts = datetime.datetime.strptime(args.start_date, "%Y-%m-%d").timestamp() if args.start_date else 0.0
+    end_ts = datetime.datetime.strptime(args.end_date, "%Y-%m-%d").timestamp() if args.end_date else float("inf")
+    all_events = []
+    for item in data[:args.max_users]:
+        uid = item["question_id"]
+        if not args.skip_history:
+            for s, d in zip(item.get("haystack_sessions", [])[:args.max_sessions_per_user], item.get("haystack_dates", [])):
+                ts = parse_date(d)
+                if start_ts <= ts <= end_ts:
+                    msg_tagged = [dict(m, time_stamp=d) for m in s]
+                    all_events.append({"ts": ts, "type": "archive", "user_id": uid, "content": msg_tagged})
+        if not args.skip_queries:
+            q_date = item.get("question_date")
+            if q_date:
+                ts = parse_date(q_date)
+                if start_ts <= ts <= end_ts:
+                    all_events.append({"ts": ts, "type": "query", "user_id": uid, "content": item["question"]})
+    all_events.sort(key=lambda x: x["ts"])
+    return all_events[:args.max_events] if args.max_events > 0 else all_events
+
 async def monitor_throughput(metrics, stop_event):
     last_count = 0
     last_time = time.time()
@@ -400,175 +358,91 @@ async def monitor_throughput(metrics, stop_event):
         await asyncio.sleep(5)
         now = time.time()
         with metrics.lock:
-            current_count = metrics.total_completed
-            errors = metrics.total_errors
-        
-        delta_count = current_count - last_count
-        delta_time = now - last_time
-        tput = delta_count / delta_time if delta_time > 0 else 0
-        elapsed = now - metrics.start_time
-        
-        metrics.throughput_records.append({
-            "elapsed_sec": elapsed,
-            "throughput_eps": tput,
-            "completed_so_far": current_count,
-            "errors_so_far": errors
-        })
-        print(f"   >>> [{elapsed:6.1f}s] T-Put: {tput:6.2f} eps | Total: {current_count:5} | Errors: {errors}")
-        
-        last_count = current_count
-        last_time = now
+            cur, err = metrics.total_completed, metrics.total_errors
+            delta, dt = cur - last_count, now - last_time
+            tput = delta / dt if dt > 0 else 0
+            metrics.throughput_records.append({"elapsed_sec": now - metrics.start_time, "throughput_eps": tput, "completed_so_far": cur, "errors_so_far": err})
+            last_count, last_time = cur, now
+            print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Total: {cur:5}")
 
 async def run_simulation(events, args, memory, rate_limiter):
-    metrics = LoadTestMetrics()
     sem = asyncio.Semaphore(args.concurrency_limit)
-    
-    if not events: return
-
-    first_ts = events[0]["ts"]
-    real_start = time.time()
+    first_ts, start_wall = events[0]["ts"], time.time()
+    stop_mon = asyncio.Event()
+    mon_task = asyncio.create_task(monitor_throughput(GLOBAL_METRICS, stop_mon))
     tasks = []
-    stop_monitor = asyncio.Event()
-
-    # Start throughput monitor task
-    monitor_task = asyncio.create_task(monitor_throughput(metrics, stop_monitor))
-
-    async def execute_event(event):
+    async def run_event(event):
         async with sem:
             await rate_limiter.wait()
-            start_t = time.perf_counter()
-            status = "success"
-            stage_timings = None
+            st = time.perf_counter()
             try:
                 if event["type"] == "archive":
-                    result = await asyncio.to_thread(
-                        memory.add_memory,
-                        messages=event["content"],
-                        user_id=event["user_id"],
-                        force_segment=True,
-                        force_extract=True
-                    )
-                    if isinstance(result, dict) and "extraction_future" in result:
-                        await asyncio.wrap_future(result["extraction_future"])
-                elif event["type"] == "query":
-                    # Simulating a retrieval query
-                    await asyncio.to_thread(
-                        memory.retrieve_memory,
-                        query=event["content"],
-                        user_id=event["user_id"]
-                    )
+                    res = await asyncio.to_thread(memory.add_memory, messages=event["content"], user_id=event["user_id"], force_segment=True, force_extract=True)
+                    if isinstance(res, dict) and "extraction_future" in res:
+                        await asyncio.wrap_future(res["extraction_future"])
+                else:
+                    await asyncio.to_thread(memory.retrieve_memory, query=event["content"], user_id=event["user_id"])
                 
-                # Try to get stage timings if available from memory stats
-                stats = memory.get_token_statistics()
-                stage_timings = stats.get("stage_timings", {})
-                memory.reset_token_statistics() # Reset for next event to avoid accumulation overlap if serial
-                
+                # Protect stats collection and reset
+                with GLOBAL_METRICS.lock:
+                    stats = memory.get_token_statistics()
+                    stage_timings = stats.get("stage_timings")
+                    memory.reset_token_statistics()
+                    GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success", stage_timings)
+                    
             except Exception as e:
-                print(f"Error in {event['type']} for {event['user_id']}: {e}")
-                status = "error"
-            
-            latency = time.perf_counter() - start_t
-            metrics.record(event["type"], event["user_id"], latency, status, stage_timings)
+                # Log the error but keep the simulation running
+                print(f"Error in {event['type']} for user {event['user_id']}: {e}")
+                with GLOBAL_METRICS.lock:
+                    GLOBAL_METRICS.record(event["type"], event["user_id"], 0, "error")
 
-    for i, event in enumerate(events):
-        dataset_offset = event["ts"] - first_ts
-        target_real_time = real_start + (dataset_offset / args.time_scale)
-        delay = target_real_time - time.time()
+    for i, ev in enumerate(events):
+        delay = start_wall + ((ev["ts"] - first_ts) / args.time_scale) - time.time()
         if delay > 0: await asyncio.sleep(delay)
-        tasks.append(asyncio.create_task(execute_event(event)))
+        tasks.append(asyncio.create_task(run_event(ev)))
         if (i+1) % 50 == 0: print(f"Dispatched {i+1}/{len(events)} events...")
-
     await asyncio.gather(*tasks)
-    
-    # Wait a moment for final metrics and stop monitor
-    await asyncio.sleep(2)
-    stop_monitor.set()
-    await monitor_task
-    
+    await asyncio.sleep(2); stop_mon.set(); await mon_task
+    GLOBAL_METRICS.simulation_finished = True
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename_base = f"profiling_runs/{args.run_name}_{args.provider}_{run_id}"
-    metrics.save(filename_base)
-
-# ============================================================
-# SETUP LIGHTMEM
-# ============================================================
+    GLOBAL_METRICS.save(f"profiling_runs/{args.run_name}_{args.provider}_{run_id}")
 
 def setup_lightmem(args):
     builder = _BUILDERS.get(args.provider)
-    memory_manager_cfg = builder(args)
-    
-    config = {
-        "pre_compress": True,
-        "pre_compressor": {
-            "model_name": "llmlingua-2",
-            "configs": {
-                "llmlingua_config": {
-                    "model_name":    os.getenv("LLMLINGUA_MODEL_PATH"),
-                    "device_map":    "cpu",
-                    "use_llmlingua2": True,
-                },
-                "compress_config": {"rate": 0.6},
-            },
-        },
-        "topic_segment":        True,
-        "precomp_topic_shared": True,
-        "topic_segmenter":      {"model_name": "llmlingua-2"},
-        "messages_use":         "user_only",
-        "metadata_generate":    True,
-        "text_summary":         True,
-        "memory_manager":       memory_manager_cfg,
-        "extract_threshold":    0.1,
-        "index_strategy":       "embedding",
-        "text_embedder": {
-            "model_name": "huggingface",
-            "configs": {
-                "model":          os.getenv("EMBEDDING_MODEL_PATH"),
-                "embedding_dims": 384,
-                "model_kwargs":   {"device": "cpu"},
-            },
-        },
-        "retrieve_strategy": "embedding",
-        "embedding_retriever": {
-            "model_name": "qdrant",
-            "configs": {
-                "collection_name": f"mt_{uuid.uuid4().hex[:4]}",
-                "embedding_model_dims": 384,
-                "path": f"{os.getenv('QDRANT_DATA_DIR')}/multitenant",
-            },
-        },
-        "update": "offline" if args.provider == "vllm" else "sync",
-        "logging": {"level": "INFO"}
-    }
-    return LightMemory.from_config(config)
+    cfg = builder(args)
+    return LightMemory.from_config({
+        "pre_compress": True, "pre_compressor": {"model_name": "llmlingua-2", "configs": {"llmlingua_config": {"model_name": os.getenv("LLMLINGUA_MODEL_PATH"), "device_map": "cpu", "use_llmlingua2": True}, "compress_config": {"rate": 0.6}}},
+        "topic_segment": True, "precomp_topic_shared": True, "topic_segmenter": {"model_name": "llmlingua-2"},
+        "messages_use": "user_only", "metadata_generate": True, "text_summary": True, "memory_manager": cfg, "extract_threshold": 0.1,
+        "index_strategy": "embedding", "text_embedder": {"model_name": "huggingface", "configs": {"model": os.getenv("EMBEDDING_MODEL_PATH"), "embedding_dims": 384, "model_kwargs": {"device": "cpu"}}},
+        "retrieve_strategy": "embedding", "embedding_retriever": {"model_name": "qdrant", "configs": {"collection_name": f"mt_{uuid.uuid4().hex[:4]}", "embedding_model_dims": 384, "path": f"{os.getenv('QDRANT_DATA_DIR')}/multitenant"}},
+        "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "INFO"}
+    })
 
-async def main():
+_BUILDERS = {
+    "ollama": lambda args: {"model_name": "ollama", "configs": {"model": os.getenv("OLLAMA_MODEL_NAME"), "host": os.getenv("OLLAMA_HOST"), "max_tokens": 16384}},
+    "gemini": lambda args: {"model_name": "gemini", "configs": {"model": os.getenv("GEMINI_MODEL_NAME"), "api_key": os.getenv("GEMINI_API_KEY"), "max_tokens": 16384}},
+    "vllm": lambda args: {"model_name": "vllm", "configs": {"model": os.getenv("VLLM_MODEL_NAME"), "api_key": os.getenv("VLLM_API_KEY", "EMPTY"), "max_tokens": 16384, "vllm_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"), "llm_batch_size": args.llm_batch_size, "llm_batch_timeout": args.llm_batch_timeout, "vllm_adaptive_shaping": args.vllm_adaptive_shaping, "vllm_metrics_url": args.vllm_metrics_url or None}},
+    "openai": lambda args: {"model_name": "openai", "configs": {"model": os.getenv("OPENAI_MODEL_NAME"), "api_key": os.getenv("OPENAI_API_KEY"), "max_tokens": 16384}},
+    "mock": lambda args: {"model_name": "mock", "configs": {"model": "mock-model"}}
+}
+
+def main_cli():
     args = parse_args()
-    validate_env(args.provider)
     os.makedirs("profiling_runs", exist_ok=True)
-    
-    data_path = args.data_path or os.getenv("DATA_PATH")
-    events = load_events(data_path, args)
-    
-    if not events:
-        print("No events to simulate.")
-        return
-
-    # Calculate time scale if target duration is provided
+    events = load_events(args.data_path or os.getenv("DATA_PATH"), args)
+    if not events: return
     if args.target_duration > 0:
         span = events[-1]["ts"] - events[0]["ts"]
-        if span > 0:
-            args.time_scale = span / args.target_duration
-            print(f"Calculated time-scale: {args.time_scale:.2f} (Dataset span: {span/3600:.1f} hours -> Target: {args.target_duration} seconds)")
-        else:
-            args.time_scale = 1.0 # Or some default
-            print("Warning: Dataset span is 0, using time-scale 1.0")
-    else:
-        print(f"Using fixed time-scale: {args.time_scale:.2f}")
-    
+        args.time_scale = span / args.target_duration if span > 0 else 1.0
+        print(f"Target duration {args.target_duration}s -> Scale {args.time_scale:.2f}")
+
     memory = setup_lightmem(args)
-    rate_limiter = AsyncRateLimiter(args.rpm)
-    
-    await run_simulation(events, args, memory, rate_limiter)
+    limiter = AsyncRateLimiter(args.rpm)
+
+    threading.Thread(target=lambda: asyncio.run(run_simulation(events, args, memory, limiter)), daemon=True).start()
+    print(f"Dashboard serving at http://localhost:{args.port}")
+    app.run(host="0.0.0.0", port=args.port, debug=False)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main_cli()
