@@ -317,11 +317,18 @@ def load_events(data_path: str, args):
             for session, date_str in zip(h_sessions[:args.max_sessions_per_user], h_dates[:args.max_sessions_per_user]):
                 ts = parse_date(date_str)
                 if start_ts <= ts <= end_ts:
+                    # Tag every message with the timestamp required by LightMem
+                    tagged_session = []
+                    for msg in session:
+                        msg_copy = dict(msg)
+                        msg_copy["time_stamp"] = date_str
+                        tagged_session.append(msg_copy)
+                        
                     all_events.append({
                         "ts": ts,
                         "type": "archive",
                         "user_id": user_id,
-                        "content": session
+                        "content": tagged_session
                     })
         
         # Query
