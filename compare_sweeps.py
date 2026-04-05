@@ -6,125 +6,185 @@ import argparse
 import sys
 
 # ============================================================
-# DESIGN SYSTEM (Matching lightmem_profiler.py)
+# DESIGN SYSTEM (Research / Academic Style)
 # ============================================================
-BG         = "#0f1117"
-CARD_BG    = "#1a1d27"
-BORDER     = "#2a2d3e"
-ACCENT     = "#6366f1"  # Gemini color (Primary)
-ACCENT2    = "#22d3ee"  # Ollama color (Secondary)
-ACCENT3    = "#f59e0b"
-ACCENT4    = "#10b981"
-ACCENT_ERR = "#ef4444"
-TEXT       = "#e2e8f0"
-TEXT_DIM   = "#64748b"
-
 PLOT_LAYOUT = dict(
-    template="plotly_dark",
-    paper_bgcolor=BG,
-    plot_bgcolor=CARD_BG,
-    font=dict(color=TEXT, family="Inter, sans-serif", size=12),
-    margin=dict(l=60, r=40, t=80, b=60),
-    xaxis=dict(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True, title="Concurrency"),
-    yaxis=dict(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True),
-    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor=BORDER, x=0.02, y=0.98),
+    template="plotly_white",
+    font=dict(color="black", family="Inter, sans-serif", size=14),
+    margin=dict(l=80, r=40, t=100, b=120), # Increased bottom margin for legend
+    xaxis=dict(
+        showgrid=True, gridcolor='rgba(0,0,0,0.1)', 
+        linecolor='black', linewidth=1.5, mirror=True, 
+        title="Concurrency", ticks='outside'
+    ),
+    yaxis=dict(
+        showgrid=True, gridcolor='rgba(0,0,0,0.1)', 
+        linecolor='black', linewidth=1.5, mirror=True,
+        ticks='outside'
+    ),
+    legend=dict(
+        orientation="h",
+        yanchor="top",
+        y=-0.12,
+        xanchor="center",
+        x=0.5,
+        bgcolor="rgba(255,255,255,0.8)", 
+        bordercolor='black', borderwidth=1,
+        font=dict(size=11),
+    ),
 )
 
-def create_comparison_graph(csv1_path, csv2_path, output_path="comparison_results.html"):
-    # Load data
-    df1 = pd.read_csv(csv1_path, skipinitialspace=True)
-    df2 = pd.read_csv(csv2_path, skipinitialspace=True)
-    
-    # Strip whitespace from column names to prevent KeyErrors from padded CSVs
-    df1.columns = df1.columns.str.strip()
-    df2.columns = df2.columns.str.strip()
-    
-    # Extract labels from filenames
-    name1 = os.path.basename(csv1_path).replace("lightmem_sweep_", "").replace(".csv", "").replace("_", " ").title()
-    name2 = os.path.basename(csv2_path).replace("lightmem_sweep_", "").replace(".csv", "").replace("_", " ").title()
+# High-contrast Research Palette
+RESEARCH_COLORS = [
+    "#1f77b4", # Blue
+    "#d62728", # Red
+    "#2ca02c", # Green
+    "#ff7f0e", # Orange
+    "#9467bd", # Purple
+    "#8c564b", # Brown
+]
 
-    # Create subplots
+def shorten_model_name(name):
+    """Make model names more concise for research plots."""
+    n = name.lower()
+    if n.startswith("google-"): name = name[len("google-"):]
+    elif n.startswith("mistralai-"): name = name[len("mistralai-"):]
+    elif n.startswith("qwen-"): name = name[len("qwen-"):]
+    
+    # Remove common suffixes
+    for suffix in ["-it", "-instruct-v0.3", "-instruct", "-instruct-v3"]:
+        if name.lower().endswith(suffix):
+            name = name[:-len(suffix)]
+    return name
+
+def parse_filename(filepath):
+    """
+    Parse filename for model and run_name according to lightmem_profiler naming convention:
+    lightmem_sweep_{provider}_{model}_{run_name}_{date}_{time}.csv
+    """
+    base = os.path.basename(filepath).replace(".csv", "")
+    parts = base.split("_")
+    
+    # Defaults
+    model = "Unknown"
+    run_name = base
+    
+    if len(parts) >= 7:
+        model = parts[3]
+        run_name = parts[4]
+    
+    return model, run_name
+
+def create_comparison_graph(csv_paths, output_path="comparison_results.html"):
+    # Load all datasets
+    runs = []
+    for p in csv_paths:
+        if not os.path.exists(p):
+            print(f"Warning: Skipping missing file: {p}")
+            continue
+            
+        df = pd.read_csv(p, skipinitialspace=True)
+        df.columns = df.columns.str.strip()
+        
+        model, run_name = parse_filename(p)
+        batch_type = "Batch" if "with-batch" in run_name.lower() else "Base"
+        
+        runs.append({
+            "model": model,
+            "run_name": run_name,
+            "batch_type": batch_type,
+            "df": df,
+            "path": p
+        })
+
+    if not runs:
+        print("Error: No data to plot.")
+        return
+
+    # Group by model
+    models = sorted(list(set(r["model"] for r in runs)))
+    num_models = len(models)
+    
+    # Create subplots grid: 2x2 for Throughput, Latency, Error, LLM Time
     fig = make_subplots(
         rows=2, cols=2,
-        subplot_titles=(
-            "Throughput (writes/sec)", 
-            "P95 Latency (seconds)",
-            "Error Rate (%)",
-            "Avg LLM Time (seconds)"
-        ),
+        subplot_titles=[
+            "Throughput (writes/s) ↑", 
+            "P95 Latency (s) ↓", 
+            "Error Rate (%) ↓", 
+            "Avg LLM Time (s) ↓"
+        ],
         vertical_spacing=0.15,
-        horizontal_spacing=0.1
+        horizontal_spacing=0.12
     )
 
     metrics = [
-        ("throughput", "Throughput (writes/sec)", 1, 1),
-        ("p95", "P95 Latency (s)", 1, 2),
-        ("error_rate", "Error Rate", 2, 1),
-        ("avg_llm_time", "Avg LLM Time (s)", 2, 2)
+        ("throughput",   1, 1),
+        ("p95",          1, 2),
+        ("error_rate",   2, 1),
+        ("avg_llm_time", 2, 2)
     ]
 
-    for col_name, title, row, col in metrics:
-        # Trace for CSV 1
-        fig.add_trace(
-            go.Scatter(
-                x=df1["concurrency"], y=df1[col_name],
-                name=f"{name1}",
-                mode="lines+markers",
-                line=dict(color=ACCENT, width=3),
-                marker=dict(size=8),
-                legendgroup="group1",
-                showlegend=(row == 1 and col == 1)
-            ),
-            row=row, col=col
-        )
-        # Trace for CSV 2
-        fig.add_trace(
-            go.Scatter(
-                x=df2["concurrency"], y=df2[col_name],
-                name=f"{name2}",
-                mode="lines+markers",
-                line=dict(color=ACCENT2, width=3),
-                marker=dict(size=8),
-                legendgroup="group2",
-                showlegend=(row == 1 and col == 1)
-            ),
-            row=row, col=col
-        )
+    # Map models to colors
+    color_map = {model: RESEARCH_COLORS[i % len(RESEARCH_COLORS)] for i, model in enumerate(models)}
+
+    for m_idx, model in enumerate(models):
+        model_runs = [r for r in runs if r["model"] == model]
+        # Sort to ensure consistent line styles (Base then Batch)
+        model_runs.sort(key=lambda x: 0 if x["batch_type"] == "Base" else 1)
+
+        display_model = shorten_model_name(model)
+
+        for run in model_runs:
+            dash = "dash" if "Batch" in run["batch_type"] else None
+            width = 3 if dash else 4
+            color = color_map[model]
+            
+            for m_name, row, col in metrics:
+                if m_name not in run["df"].columns:
+                    continue
+                
+                y_data = run["df"][m_name]
+                if m_name == "error_rate" and y_data.max() <= 1.0:
+                    y_data = y_data * 100
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=run["df"]["concurrency"], 
+                        y=y_data,
+                        name=f"{display_model} ({run['batch_type']})",
+                        mode="lines+markers",
+                        line=dict(color=color, width=width, dash=dash),
+                        marker=dict(size=7, symbol="circle" if not dash else "diamond"),
+                        legendgroup=f"{model}",
+                    ),
+                    row=row, col=col
+                )
+
+    # Styling subplot titles
+    for i in range(len(fig.layout.annotations)):
+        fig.layout.annotations[i].font = dict(size=14, color="black", family="Inter, sans-serif")
 
     # Update layout
     fig.update_layout(
         **PLOT_LAYOUT,
         height=900,
-        width=1200,
-        title_text=f"LightMem Comparison: {name1} vs {name2}",
+        width=1300,
+        title_text="LightMem Multi-Model Performance Comparison",
         title_x=0.5,
-        title_font=dict(size=24, color=TEXT)
+        title_font=dict(size=24, color="black", family="Inter, sans-serif")
     )
-
-    # Update axes for all subplots
-    fig.update_xaxes(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True, title="Concurrency")
-    fig.update_yaxes(gridcolor=BORDER, linecolor=BORDER, zeroline=False, showline=True)
 
     # Save to HTML
     fig.write_html(output_path)
-    print(f"Comparison graph saved to: {output_path}")
-    
-    # Also show it if in a notebook/interactive environment
-    # fig.show()
+    print(f"Optimized research graph saved to: {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare two LightMem profiling CSV sweeps.")
+    parser = argparse.ArgumentParser(description="Compare multiple LightMem profiling CSV sweeps in Concise Style.")
     parser.add_argument(
-        "--csv1",
-        type=str,
-        default="/Users/chinmaydandekar/Desktop/i/CS 598 - Systems for GenAI/lightmem-playground/profiling_runs/lightmem_sweep_gemini_base.csv",
-        help="Path to the first CSV sweep (e.g., Gemini baseline)."
-    )
-    parser.add_argument(
-        "--csv2",
-        type=str,
-        default="/Users/chinmaydandekar/Desktop/i/CS 598 - Systems for GenAI/lightmem-playground/profiling_runs/lightmem_sweep_ollama_gemma_12b_base.csv",
-        help="Path to the second CSV sweep (e.g., Ollama baseline)."
+        "csvs",
+        nargs="*",
+        help="List of CSV files to compare."
     )
     parser.add_argument(
         "--output",
@@ -135,11 +195,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    if not os.path.exists(args.csv1):
-        print(f"Error: CSV 1 not found: {args.csv1}")
-        sys.exit(1)
-    if not os.path.exists(args.csv2):
-        print(f"Error: CSV 2 not found: {args.csv2}")
+    if not args.csvs:
+        print("No CSV files provided.")
         sys.exit(1)
         
-    create_comparison_graph(args.csv1, args.csv2, args.output)
+    create_comparison_graph(args.csvs, args.output)
