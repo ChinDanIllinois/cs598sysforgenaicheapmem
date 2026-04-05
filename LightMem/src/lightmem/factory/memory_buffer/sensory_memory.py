@@ -57,10 +57,13 @@ class SenMemBufferManager:
             return segments
 
         turns = []
-        for i in range(0, len(self.buffer), 2):
+        i = 0
+        while i < len(self.buffer):
             user_msg = self.buffer[i]["content"]
-            assistant_msg = self.buffer[i + 1]["content"]
-            turns.append(user_msg + " " + assistant_msg)
+            # Safely handle odd message counts by providing a placeholder for the assistant
+            assistant_msg = self.buffer[i + 1]["content"] if (i + 1) < len(self.buffer) else ""
+            turns.append(f"{user_msg} {assistant_msg}")
+            i += 2
 
         embeddings = []
         for turn in turns:

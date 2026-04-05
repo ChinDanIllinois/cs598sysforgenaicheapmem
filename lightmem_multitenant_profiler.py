@@ -371,9 +371,16 @@ async def run_simulation(events, args, memory, rate_limiter):
     stop_mon = asyncio.Event()
     mon_task = asyncio.create_task(monitor_throughput(GLOBAL_METRICS, stop_mon))
     tasks = []
+    user_locks = {}
+
     async def run_event(event):
-        async with sem:
-            await rate_limiter.wait()
+        uid = event["user_id"]
+        if uid not in user_locks:
+            user_locks[uid] = asyncio.Lock()
+            
+        async with user_locks[uid]:
+            async with sem:
+                await rate_limiter.wait()
             st = time.perf_counter()
             try:
                 if event["type"] == "archive":
