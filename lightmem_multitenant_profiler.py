@@ -73,7 +73,7 @@ class LoadTestMetrics:
         self.total_errors = 0
         self.start_time = time.time()
         self.simulation_finished = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def record(self, event_type, user_id, latency, status="success", stage_timings=None):
         row = {
