@@ -1,12 +1,12 @@
 import dash
-from dash import dcc, html, callback_context
-from dash.dependencies import Input, Output, State
+from dash import dcc, html
+from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 import requests
-import re
 import time
 from datetime import datetime
 from collections import deque
+from prometheus_client.parser import text_string_to_metric_families
 
 # --- CONFIGURATION ---
 VLLM_METRICS_URL = "http://localhost:8000/metrics"
@@ -36,15 +36,7 @@ EXTERNAL_STYLESHEETS = [
 # --- METRICS DATA STORAGE ---
 history = {
     'timestamps': deque(maxlen=MAX_DATA_POINTS),
-    'running': deque(maxlen=MAX_DATA_POINTS),
-    'waiting': deque(maxlen=MAX_DATA_POINTS),
-    'gpu_cache': deque(maxlen=MAX_DATA_POINTS),
-    'cpu_cache': deque(maxlen=MAX_DATA_POINTS),
     'throughput': deque(maxlen=MAX_DATA_POINTS),
-    'reg_rps': deque(maxlen=MAX_DATA_POINTS),
-    'batch_rps': deque(maxlen=MAX_DATA_POINTS),
-    'reg_latency': deque(maxlen=MAX_DATA_POINTS),
-    'batch_latency': deque(maxlen=MAX_DATA_POINTS),
 }
 
 last_metrics = {
@@ -52,66 +44,89 @@ last_metrics = {
     'reg_count': 0, 'batch_count': 0
 }
 
-def get_metric_value(name, labels, text):
-    """Robust extractor for Prometheus metrics with optional labels."""
-    # Build label pattern
-    if labels:
-        label_str = r'\{'
-        for k, v in labels.items():
-            label_str += rf'.*?{k}="{v}"'
-        label_str += r'.*?\}'
-    else:
-        label_str = r'(?:\{.*?\})?'
-    
-    pattern = rf'{name}{label_str}\s+([\d.e+-]+)'
-    match = re.search(pattern, text)
-    if match:
-        return float(match.group(1))
+def get_metric_from_families(families, name, labels=None):
+    """Finds a specific sample in families matching name and labels."""
+    for family in families:
+        for sample in family.samples:
+            if sample.name == name:
+                if labels:
+                    if all(sample.labels.get(k) == v for k, v in labels.items()):
+                        return sample.value
+                else:
+                    return sample.value
     return 0.0
 
+def get_buckets_from_families(families, name, labels=None):
+    """Extracts all buckets for a histogram matching name and labels."""
+    buckets = []
+    bucket_name = f"{name}_bucket"
+    for family in families:
+        for sample in family.samples:
+            if sample.name == bucket_name:
+                if labels:
+                    if not all(sample.labels.get(k) == v for k, v in labels.items() if k != 'le'):
+                        continue
+                
+                le = sample.labels.get('le', '+Inf')
+                le_val = float('inf') if le == '+Inf' else float(le)
+                buckets.append((le_val, float(sample.value)))
+    return sorted(buckets)
+
+def compute_histogram_dist(buckets):
+    """Converts cumulative buckets to discrete distribution for bar charts."""
+    if not buckets: return [], []
+    x_labels, y_values, last_count = [], [], 0.0
+    for le, count in buckets:
+        label = f"<{le}" if le != float('inf') else "Outlier"
+        x_labels.append(label)
+        y_values.append(max(0.0, float(count) - last_count))
+        last_count = float(count)
+    return x_labels, y_values
+
 def parse_vllm_metrics():
-    """Parses vLLM Prometheus metrics including HTTP handler stats."""
+    """Professional parser using the official prometheus_client library."""
     try:
         response = requests.get(VLLM_METRICS_URL, timeout=1)
-        if response.status_code != 200:
-            return None
+        if response.status_code != 200: return None
         
-        text = response.text
+        families = list(text_string_to_metric_families(response.text))
         metrics = {}
         
-        # Core vLLM engine metrics
-        metrics['running'] = get_metric_value("vllm:num_requests_running", {}, text)
-        metrics['waiting'] = get_metric_value("vllm:num_requests_waiting", {}, text)
-        metrics['swapped'] = get_metric_value("vllm:num_requests_swapped", {}, text)
+        # Core Engine
+        metrics['running'] = get_metric_from_families(families, "vllm:num_requests_running")
+        metrics['waiting'] = get_metric_from_families(families, "vllm:num_requests_waiting")
         
-        # vLLM changed gpu_cache_usage_perc to kv_cache_usage_perc in recent versions
-        metrics['gpu_cache'] = get_metric_value("vllm:kv_cache_usage_perc", {}, text)
-        if metrics['gpu_cache'] == 0:
-            metrics['gpu_cache'] = get_metric_value("vllm:gpu_cache_usage_perc", {}, text)
+        # Cache
+        metrics['kv_cache'] = get_metric_from_families(families, "vllm:kv_cache_usage_perc")
+        if metrics['kv_cache'] == 0:
+            metrics['kv_cache'] = get_metric_from_families(families, "vllm:gpu_cache_usage_perc")
+        
+        # RAM
+        metrics['rss_mem'] = get_metric_from_families(families, "process_resident_memory_bytes") / (1024**3)
+        metrics['vms_mem'] = get_metric_from_families(families, "process_virtual_memory_bytes") / (1024**3)
             
-        metrics['cpu_cache'] = get_metric_value("vllm:cpu_cache_usage_perc", {}, text)
+        # Throughput
+        metrics['prompt_tokens_total'] = get_metric_from_families(families, "vllm:prompt_tokens_total")
+        metrics['generation_tokens_total'] = get_metric_from_families(families, "vllm:generation_tokens_total")
         
-        metrics['prompt_tokens_total'] = get_metric_value("vllm:prompt_tokens_total", {}, text)
-        metrics['generation_tokens_total'] = get_metric_value("vllm:generation_tokens_total", {}, text)
+        # HTTP
+        metrics['reg_count'] = get_metric_from_families(families, "http_requests_total", {"handler": "/v1/chat/completions"})
+        metrics['batch_count'] = get_metric_from_families(families, "http_requests_total", {"handler": "/v1/chat/completions/batch"})
+        metrics['reg_lat_sum'] = get_metric_from_families(families, "http_request_duration_seconds_sum", {"handler": "/v1/chat/completions"})
+        metrics['reg_lat_count'] = get_metric_from_families(families, "http_request_duration_seconds_count", {"handler": "/v1/chat/completions"})
         
-        # HTTP Handler Metrics (Regular vs Batch)
-        metrics['reg_count'] = get_metric_value("http_requests_total", {"handler": "/v1/chat/completions", "status": "2xx"}, text)
-        metrics['batch_count'] = get_metric_value("http_requests_total", {"handler": "/v1/chat/completions/batch", "status": "2xx"}, text)
-        
-        metrics['reg_lat_sum'] = get_metric_value("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions"}, text)
-        metrics['reg_lat_count'] = get_metric_value("http_request_duration_seconds_count", {"handler": "/v1/chat/completions"}, text)
-        
-        metrics['batch_lat_sum'] = get_metric_value("http_request_duration_seconds_sum", {"handler": "/v1/chat/completions/batch"}, text)
-        metrics['batch_lat_count'] = get_metric_value("http_request_duration_seconds_count", {"handler": "/v1/chat/completions/batch"}, text)
+        # Histograms
+        metrics['hist_ttft'] = get_buckets_from_families(families, "vllm:time_to_first_token_seconds")
+        metrics['hist_itl'] = get_buckets_from_families(families, "vllm:inter_token_latency_seconds")
+        metrics['hist_e2e'] = get_buckets_from_families(families, "vllm:e2e_request_latency_seconds")
                 
         return metrics
     except Exception as e:
-        print(f"Error fetching metrics: {e}")
+        print(f"Metrics collection failed: {e}")
         return None
 
 # --- DASH APP ---
 app = dash.Dash(__name__, external_stylesheets=EXTERNAL_STYLESHEETS)
-server = app.server
 
 app.index_string = f'''
 <!DOCTYPE html>
@@ -134,15 +149,11 @@ app.index_string = f'''
                 backdrop-filter: blur(12px);
                 border: 1px solid rgba(255, 255, 255, 0.1);
                 border-radius: 16px;
-                padding: 24px;
+                padding: 20px;
                 box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-                transition: transform 0.2s ease, border-color 0.2s ease;
-            }}
-            .glass-card:hover {{
-                border-color: {COLORS['accent']};
             }}
             .stat-value {{
-                font-size: 2.5rem;
+                font-size: 2.2rem;
                 font-weight: 700;
                 background: linear-gradient(to right, {COLORS['accent']}, {COLORS['accent_secondary']});
                 -webkit-background-clip: text;
@@ -150,12 +161,13 @@ app.index_string = f'''
             }}
             .stat-label {{
                 color: {COLORS['text_muted']};
-                font-size: 0.875rem;
+                font-size: 0.75rem;
                 text-transform: uppercase;
                 letter-spacing: 0.05em;
+                margin-bottom: 4px;
             }}
             .header-dash {{
-                padding: 2rem 0;
+                padding: 1.5rem 0;
                 background: radial-gradient(circle at top right, rgba(56, 189, 248, 0.1), transparent);
             }}
             .status-indicator {{
@@ -187,104 +199,115 @@ app.layout = html.Div([
     html.Div([
         html.Div([
             html.Div([
-                html.H1("vLLM Engine Insights", className="mb-0 fw-bold"),
+                html.H2("vLLM Engine Insights", className="mb-0 fw-bold"),
                 html.P([
                     html.Span(id='status-dot', className="status-indicator status-offline"),
-                    html.Span(id='status-text', children="Connecting to vLLM...")
-                ], className="mb-0 mt-2")
+                    html.Span(id='status-text', children="Connecting...")
+                ], className="mb-0 mt-1 small")
             ], className="col-md-6"),
             html.Div([
-                html.P(f"Monitoring: {VLLM_METRICS_URL}", className="text-end text-muted small")
+                html.P(f"Target: {VLLM_METRICS_URL}", className="text-end text-muted small mb-0")
             ], className="col-md-6 d-flex align-items-center justify-content-end")
         ], className="row g-0 container mx-auto px-4")
     ], className="header-dash mb-4"),
 
     html.Div([
-        # Row  summary Stats
+        # Main Stats Row
         html.Div([
             html.Div([
                 html.Div([
-                    html.Div("Running Requests", className="stat-label"),
-                    html.Div(id="val-running", children="0", className="stat-value"),
-                ], className="glass-card h-100")
-            ], className="col-md-4"),
-            html.Div([
-                html.Div([
-                    html.Div("Waiting in Queue", className="stat-label"),
-                    html.Div(id="val-waiting", children="0", className="stat-value"),
-                ], className="glass-card h-100")
-            ], className="col-md-4"),
-            html.Div([
-                html.Div([
-                    html.Div("Tokens / Sec", className="stat-label"),
-                    html.Div(id="val-throughput", children="0.0", className="stat-value"),
-                ], className="glass-card h-100")
-            ], className="col-md-4"),
-        ], className="row mb-3"),
-
-        html.Div([
-            html.Div([
-                html.Div([
-                    html.Div("GPU Cache Usage", className="stat-label"),
-                    html.Div(id="val-gpu-perc", children="0%", className="stat-value"),
-                ], className="glass-card h-100")
+                    html.Div("Running Req", className="stat-label"),
+                    html.Div(id="val-running", className="stat-value"),
+                ], className="glass-card")
             ], className="col-md-3"),
             html.Div([
                 html.Div([
-                    html.Div("Batch Traffic (Req)", className="stat-label"),
-                    html.Div(id="val-batch-count", children="0", className="stat-value"),
-                ], className="glass-card h-100")
+                    html.Div("Queue Depth", className="stat-label"),
+                    html.Div(id="val-waiting", className="stat-value"),
+                ], className="glass-card")
             ], className="col-md-3"),
             html.Div([
                 html.Div([
-                    html.Div("Reg Latency (s)", className="stat-label"),
-                    html.Div(id="val-reg-lat", children="0", className="stat-value"),
-                ], className="glass-card h-100")
+                    html.Div("Throughput (tok/s)", className="stat-label"),
+                    html.Div(id="val-throughput", className="stat-value"),
+                ], className="glass-card")
             ], className="col-md-3"),
             html.Div([
                 html.Div([
-                    html.Div("Batch Latency (s)", className="stat-label"),
-                    html.Div(id="val-batch-lat", children="0", className="stat-value"),
-                ], className="glass-card h-100")
+                    html.Div("Process RAM (GB)", className="stat-label"),
+                    html.Div(id="val-rss", className="stat-value"),
+                ], className="glass-card")
             ], className="col-md-3"),
         ], className="row mb-4"),
 
-        # Row 2: Charts
+        # Cache & Latency Summary
         html.Div([
-            # Throughput History
             html.Div([
                 html.Div([
-                    html.H5("Throughput (Tokens/s)", className="mb-3 fw-bold"),
+                    html.Div("KV Cache Utilization", className="stat-label"),
+                    html.Div(id="val-kv-perc", className="stat-value"),
+                    html.Small("Portion of pre-allocated GPU blocks in use", className="text-muted", style={'fontSize': '0.6rem'})
+                ], className="glass-card")
+            ], className="col-md-3"),
+            html.Div([
+                html.Div([
+                    html.Div("Reg Latency (avg)", className="stat-label"),
+                    html.Div(id="val-reg-lat", className="stat-value"),
+                ], className="glass-card")
+            ], className="col-md-3"),
+             html.Div([
+                html.Div([
+                    html.Div("Batch Traffic", className="stat-label"),
+                    html.Div(id="val-batch-count", className="stat-value"),
+                ], className="glass-card")
+            ], className="col-md-3"),
+            html.Div([
+                html.Div([
+                    html.Div("VMS Memory (GB)", className="stat-label"),
+                    html.Div(id="val-vms", className="stat-value"),
+                ], className="glass-card")
+            ], className="col-md-3"),
+        ], className="row mb-4"),
+
+        # Charts Section
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.H6("Throughput History", className="mb-3"),
                     dcc.Graph(id='graph-throughput', config={'displayModeBar': False}),
                 ], className="glass-card")
             ], className="col-md-8"),
-            
-            # Cache Gauges
             html.Div([
                 html.Div([
-                    html.H5("Memory Utilization", className="mb-3 fw-bold"),
+                    html.H6("KV Cache Usage", className="mb-3"),
                     dcc.Graph(id='graph-cache', config={'displayModeBar': False}),
                 ], className="glass-card h-100")
             ], className="col-md-4"),
         ], className="row mb-4"),
 
-        # Row 3: Detail Charts
+        # Histograms Section
         html.Div([
-             html.Div([
+            html.Div([
                 html.Div([
-                    html.H5("HTTP Request Rate (Req/s)", className="mb-3 fw-bold"),
-                    dcc.Graph(id='graph-rps', config={'displayModeBar': False}),
+                    html.H6("Time to First Token (TTFT) Distribution", className="mb-2"),
+                    dcc.Graph(id='hist-ttft', config={'displayModeBar': False}),
                 ], className="glass-card")
-            ], className="col-md-6"),
-             html.Div([
+            ], className="col-md-4"),
+            html.Div([
                 html.Div([
-                    html.H5("Request Queue Depth", className="mb-3 fw-bold"),
-                    dcc.Graph(id='graph-queue', config={'displayModeBar': False}),
+                    html.H6("Inter-Token Latency (ITL) Distribution", className="mb-2"),
+                    dcc.Graph(id='hist-itl', config={'displayModeBar': False}),
                 ], className="glass-card")
-            ], className="col-md-6"),
+            ], className="col-md-4"),
+            html.Div([
+                html.Div([
+                    html.H6("E2E Request Latency Distribution", className="mb-2"),
+                    dcc.Graph(id='hist-e2e', config={'displayModeBar': False}),
+                ], className="glass-card")
+            ], className="col-md-4"),
         ], className="row")
 
-    ], className="container px-4")
+    ], className="container px-4 pb-5")
 ])
 
 @app.callback(
@@ -293,119 +316,78 @@ app.layout = html.Div([
      Output('val-running', 'children'),
      Output('val-waiting', 'children'),
      Output('val-throughput', 'children'),
-     Output('val-gpu-perc', 'children'),
-     Output('val-batch-count', 'children'),
+     Output('val-kv-perc', 'children'),
+     Output('val-rss', 'children'),
+     Output('val-vms', 'children'),
      Output('val-reg-lat', 'children'),
-     Output('val-batch-lat', 'children'),
+     Output('val-batch-count', 'children'),
      Output('graph-throughput', 'figure'),
      Output('graph-cache', 'figure'),
-     Output('graph-queue', 'figure'),
-     Output('graph-rps', 'figure')],
+     Output('hist-ttft', 'figure'),
+     Output('hist-itl', 'figure'),
+     Output('hist-e2e', 'figure')],
     [Input('interval-component', 'n_intervals')]
 )
 def update_dashboard(n):
     global last_metrics
-    
     metrics = parse_vllm_metrics()
     now = datetime.now()
     
     if not metrics:
-        return ("status-indicator status-offline", "vLLM Offline", "0", "0", "0.0", "0%", "0", "0.0", "0.0", 
-                go.Figure(), go.Figure(), go.Figure(), go.Figure())
+        empty_fig = go.Figure().update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        return ("status-indicator status-offline", "vLLM Offline", "0", "0", "0.0", "0%", "0.0G", "0.0G", "0.0s", "0",
+                empty_fig, empty_fig, empty_fig, empty_fig, empty_fig)
     
-    # Calculate Throughput and Rates
+    # Calculations
     current_time = time.time()
     dt = current_time - last_metrics['time']
+    total_tok = metrics['prompt_tokens_total'] + metrics['generation_tokens_total']
+    tput = ((total_tok - (last_metrics['prompt'] + last_metrics['gen'])) / dt) if (dt > 0 and last_metrics['time'] > 0) else 0.0
     
-    total_tokens = metrics['prompt_tokens_total'] + metrics['generation_tokens_total']
-    tput = 0.0
-    reg_rps = 0.0
-    batch_rps = 0.0
-    
-    if dt > 0 and last_metrics['time'] > 0:
-        tput = (total_tokens - (last_metrics['prompt'] + last_metrics['gen'])) / dt
-        reg_rps = (metrics['reg_count'] - last_metrics['reg_count']) / dt
-        batch_rps = (metrics['batch_count'] - last_metrics['batch_count']) / dt
-        
-    last_metrics = {
-        'prompt': metrics['prompt_tokens_total'],
-        'gen': metrics['generation_tokens_total'],
-        'time': current_time,
-        'reg_count': metrics['reg_count'],
-        'batch_count': metrics['batch_count']
-    }
+    last_metrics.update({
+        'prompt': metrics['prompt_tokens_total'], 'gen': metrics['generation_tokens_total'],
+        'time': current_time, 'reg_count': metrics['reg_count'], 'batch_count': metrics['batch_count']
+    })
 
-    # Calculate Latencies (from cumulative sums)
     reg_lat = (metrics['reg_lat_sum'] / metrics['reg_lat_count']) if metrics['reg_lat_count'] > 0 else 0
-    batch_lat = (metrics['batch_lat_sum'] / metrics['batch_lat_count']) if metrics['batch_lat_count'] > 0 else 0
-
-    # Update history
     history['timestamps'].append(now)
-    history['running'].append(metrics['running'])
-    history['waiting'].append(metrics['waiting'])
-    history['gpu_cache'].append(metrics['gpu_cache'] * 100)
-    history['cpu_cache'].append(metrics['cpu_cache'] * 100)
     history['throughput'].append(tput)
-    history['reg_rps'].append(reg_rps)
-    history['batch_rps'].append(batch_rps)
-    history['reg_latency'].append(reg_lat)
-    history['batch_latency'].append(batch_lat)
 
-    # Throughput Figure
-    fig_tput = go.Figure()
-    fig_tput.add_trace(go.Scatter(
+    # THROUGHPUT FIGURE
+    fig_tput = go.Figure(go.Scatter(
         x=list(history['timestamps']), y=list(history['throughput']),
-        mode='lines', name='Tokens/s',
-        line=dict(color=COLORS['accent'], width=3),
+        mode='lines', line=dict(color=COLORS['accent'], width=3),
         fill='tozeroy', fillcolor='rgba(56, 189, 248, 0.1)'
-    ))
-    fig_tput.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                          margin=dict(l=0, r=0, t=10, b=0), height=300, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+    )).update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    margin=dict(l=0, r=0, t=0, b=0), height=250, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
 
-    # RPS Figure (Regular vs Batch)
-    fig_rps = go.Figure()
-    fig_rps.add_trace(go.Scatter(
-        x=list(history['timestamps']), y=list(history['reg_rps']),
-        mode='lines', name='Regular RPS', line=dict(color=COLORS['accent'], width=2)
-    ))
-    fig_rps.add_trace(go.Scatter(
-        x=list(history['timestamps']), y=list(history['batch_rps']),
-        mode='lines', name='Batch RPS', line=dict(color=COLORS['accent_secondary'], width=2)
-    ))
-    fig_rps.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                         margin=dict(l=0, r=0, t=10, b=0), height=200, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+    # CACHE FIGURE
+    fig_cache = go.Figure(go.Bar(
+        x=['KV Cache'], y=[metrics['kv_cache']*100], marker_color=COLORS['gpu_cache'], width=0.4
+    )).update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    margin=dict(l=20, r=20, t=0, b=20), height=250, yaxis=dict(range=[0, 100], gridcolor='rgba(255,255,255,0.05)'))
 
-    # Queue Figure
-    fig_queue = go.Figure()
-    fig_queue.add_trace(go.Scatter(
-        x=list(history['timestamps']), y=list(history['running']),
-        mode='lines', name='Running', stackgroup='one', line=dict(color=COLORS['success'], width=0)
-    ))
-    fig_queue.add_trace(go.Scatter(
-        x=list(history['timestamps']), y=list(history['waiting']),
-        mode='lines', name='Waiting', stackgroup='one', line=dict(color=COLORS['warning'], width=0)
-    ))
-    fig_queue.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                           margin=dict(l=0, r=0, t=10, b=0), height=200, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+    # HISTOGRAM FIGURES
+    def create_hist_fig(buckets, color):
+        x, y = compute_histogram_dist(buckets)
+        fig = go.Figure(go.Bar(x=x, y=y, marker_color=color))
+        fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                         margin=dict(l=0, r=0, t=0, b=0), height=180, showlegend=False,
+                         xaxis=dict(tickangle=-45, tickfont=dict(size=8)),
+                         yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+        return fig
 
-    # Cache Gauges
-    fig_cache = go.Figure()
-    fig_cache.add_trace(go.Bar(
-        x=['GPU', 'CPU'], y=[metrics['gpu_cache']*100, metrics['cpu_cache']*100],
-        marker_color=[COLORS['gpu_cache'], COLORS['cpu_cache']], width=[0.5, 0.5]
-    ))
-    fig_cache.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                           margin=dict(l=20, r=20, t=10, b=20), height=300, yaxis=dict(range=[0, 100]))
+    fig_ttft = create_hist_fig(metrics['hist_ttft'], COLORS['accent'])
+    fig_itl = create_hist_fig(metrics['hist_itl'], COLORS['accent_secondary'])
+    fig_e2e = create_hist_fig(metrics['hist_e2e'], COLORS['warning'])
 
     return (
-        "status-indicator status-online", "vLLM Engine Online",
+        "status-indicator status-online", "vLLM Online",
         f"{int(metrics['running'])}", f"{int(metrics['waiting'])}", f"{tput:.1f}",
-        f"{metrics['gpu_cache']*100:.1f}%", f"{int(metrics['batch_count'])}",
-        f"{reg_lat:.2f}s", f"{batch_lat:.2f}s",
-        fig_tput, fig_cache, fig_queue, fig_rps
+        f"{metrics['kv_cache']*100:.1f}%", f"{metrics['rss_mem']:.1f}G", f"{metrics['vms_mem']:.1f}G",
+        f"{reg_lat:.2f}s", f"{int(metrics['batch_count'])}",
+        fig_tput, fig_cache, fig_ttft, fig_itl, fig_e2e
     )
 
 if __name__ == '__main__':
-    print("Starting vLLM Monitoring Dashboard on http://localhost:8050")
-    print(f"Polling vLLM Metrics at: {VLLM_METRICS_URL}")
     app.run(debug=True, port=8050)
