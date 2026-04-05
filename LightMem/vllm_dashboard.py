@@ -37,6 +37,8 @@ EXTERNAL_STYLESHEETS = [
 history = {
     'timestamps': deque(maxlen=MAX_DATA_POINTS),
     'throughput': deque(maxlen=MAX_DATA_POINTS),
+    'running': deque(maxlen=MAX_DATA_POINTS),
+    'waiting': deque(maxlen=MAX_DATA_POINTS),
 }
 
 last_metrics = {
@@ -276,35 +278,44 @@ app.layout = html.Div([
                     html.H6("Throughput History", className="mb-3"),
                     dcc.Graph(id='graph-throughput', config={'displayModeBar': False}),
                 ], className="glass-card")
-            ], className="col-md-8"),
+            ], className="col-md-6"),
             html.Div([
+                html.Div([
+                    html.H6("Queue History (Running vs Waiting)", className="mb-3"),
+                    dcc.Graph(id='graph-queue', config={'displayModeBar': False}),
+                ], className="glass-card")
+            ], className="col-md-6"),
+        ], className="row mb-4"),
+
+        html.Div([
+             html.Div([
                 html.Div([
                     html.H6("KV Cache Usage", className="mb-3"),
                     dcc.Graph(id='graph-cache', config={'displayModeBar': False}),
                 ], className="glass-card h-100")
             ], className="col-md-4"),
+            html.Div([
+                html.Div([
+                    html.H6("Time to First Token (TTFT) Distribution", className="mb-2"),
+                    dcc.Graph(id='hist-ttft', config={'displayModeBar': False}),
+                ], className="glass-card")
+            ], className="col-md-8"),
         ], className="row mb-4"),
 
         # Histograms Section
         html.Div([
             html.Div([
                 html.Div([
-                    html.H6("Time to First Token (TTFT) Distribution", className="mb-2"),
-                    dcc.Graph(id='hist-ttft', config={'displayModeBar': False}),
-                ], className="glass-card")
-            ], className="col-md-4"),
-            html.Div([
-                html.Div([
                     html.H6("Inter-Token Latency (ITL) Distribution", className="mb-2"),
                     dcc.Graph(id='hist-itl', config={'displayModeBar': False}),
                 ], className="glass-card")
-            ], className="col-md-4"),
+            ], className="col-md-6"),
             html.Div([
                 html.Div([
                     html.H6("E2E Request Latency Distribution", className="mb-2"),
                     dcc.Graph(id='hist-e2e', config={'displayModeBar': False}),
                 ], className="glass-card")
-            ], className="col-md-4"),
+            ], className="col-md-6"),
         ], className="row")
 
     ], className="container px-4 pb-5")
@@ -322,6 +333,7 @@ app.layout = html.Div([
      Output('val-reg-lat', 'children'),
      Output('val-batch-count', 'children'),
      Output('graph-throughput', 'figure'),
+     Output('graph-queue', 'figure'),
      Output('graph-cache', 'figure'),
      Output('hist-ttft', 'figure'),
      Output('hist-itl', 'figure'),
@@ -336,7 +348,7 @@ def update_dashboard(n):
     if not metrics:
         empty_fig = go.Figure().update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         return ("status-indicator status-offline", "vLLM Offline", "0", "0", "0.0", "0%", "0.0G", "0.0G", "0.0s", "0",
-                empty_fig, empty_fig, empty_fig, empty_fig, empty_fig)
+                empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig)
     
     # Calculations
     current_time = time.time()
@@ -352,6 +364,8 @@ def update_dashboard(n):
     reg_lat = (metrics['reg_lat_sum'] / metrics['reg_lat_count']) if metrics['reg_lat_count'] > 0 else 0
     history['timestamps'].append(now)
     history['throughput'].append(tput)
+    history['running'].append(metrics['running'])
+    history['waiting'].append(metrics['waiting'])
 
     # THROUGHPUT FIGURE
     fig_tput = go.Figure(go.Scatter(
@@ -359,25 +373,42 @@ def update_dashboard(n):
         mode='lines', line=dict(color=COLORS['accent'], width=3),
         fill='tozeroy', fillcolor='rgba(56, 189, 248, 0.1)'
     )).update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                    margin=dict(l=0, r=0, t=0, b=0), height=250, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+                    margin=dict(l=0, r=0, t=10, b=0), height=250, yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
+
+    # QUEUE FIGURE
+    fig_queue = go.Figure()
+    fig_queue.add_trace(go.Scatter(
+        x=list(history['timestamps']), y=list(history['running']),
+        mode='lines', name='Running', line=dict(color=COLORS['success'], width=2),
+        fill='tozeroy', fillcolor='rgba(74, 222, 128, 0.1)'
+    ))
+    fig_queue.add_trace(go.Scatter(
+        x=list(history['timestamps']), y=list(history['waiting']),
+        mode='lines', name='Waiting', line=dict(color=COLORS['warning'], width=2),
+        fill='tonexty', fillcolor='rgba(251, 191, 36, 0.1)'
+    ))
+    fig_queue.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                           margin=dict(l=0, r=0, t=10, b=0), height=250, showlegend=True,
+                           legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                           yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
 
     # CACHE FIGURE
     fig_cache = go.Figure(go.Bar(
         x=['KV Cache'], y=[metrics['kv_cache']*100], marker_color=COLORS['gpu_cache'], width=0.4
     )).update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                    margin=dict(l=20, r=20, t=0, b=20), height=250, yaxis=dict(range=[0, 100], gridcolor='rgba(255,255,255,0.05)'))
+                    margin=dict(l=20, r=20, t=20, b=20), height=250, yaxis=dict(range=[0, 100], gridcolor='rgba(255,255,255,0.05)'))
 
     # HISTOGRAM FIGURES
-    def create_hist_fig(buckets, color):
+    def create_hist_fig(buckets, color, height=180):
         x, y = compute_histogram_dist(buckets)
         fig = go.Figure(go.Bar(x=x, y=y, marker_color=color))
         fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                         margin=dict(l=0, r=0, t=0, b=0), height=180, showlegend=False,
+                         margin=dict(l=0, r=0, t=0, b=0), height=height, showlegend=False,
                          xaxis=dict(tickangle=-45, tickfont=dict(size=8)),
                          yaxis=dict(gridcolor='rgba(255,255,255,0.05)'))
         return fig
 
-    fig_ttft = create_hist_fig(metrics['hist_ttft'], COLORS['accent'])
+    fig_ttft = create_hist_fig(metrics['hist_ttft'], COLORS['accent'], height=250)
     fig_itl = create_hist_fig(metrics['hist_itl'], COLORS['accent_secondary'])
     fig_e2e = create_hist_fig(metrics['hist_e2e'], COLORS['warning'])
 
@@ -386,8 +417,10 @@ def update_dashboard(n):
         f"{int(metrics['running'])}", f"{int(metrics['waiting'])}", f"{tput:.1f}",
         f"{metrics['kv_cache']*100:.1f}%", f"{metrics['rss_mem']:.1f}G", f"{metrics['vms_mem']:.1f}G",
         f"{reg_lat:.2f}s", f"{int(metrics['batch_count'])}",
-        fig_tput, fig_cache, fig_ttft, fig_itl, fig_e2e
+        fig_tput, fig_queue, fig_cache, fig_ttft, fig_itl, fig_e2e
     )
 
 if __name__ == '__main__':
+    print("Starting vLLM Monitoring Dashboard on http://localhost:8050")
+    print(f"Polling vLLM Metrics at: {VLLM_METRICS_URL}")
     app.run(debug=True, port=8050)
