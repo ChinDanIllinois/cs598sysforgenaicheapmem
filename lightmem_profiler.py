@@ -472,10 +472,15 @@ def reset_stats(mem):
     mem.reset_token_statistics()
 
 
-print(f"Initializing LightMem with provider: {CONFIG['provider']} ...")
+print(f"Preparing LightMem for provider: {CONFIG['provider']} ...")
 collection_id = "load_test_" + uuid.uuid4().hex[:8]
-memory = load_lightmem(collection_id)
-print("LightMem initialized.")
+memory = None
+
+
+def _init_memory_for_sweep_thread() -> None:
+    global memory
+    memory = load_lightmem(collection_id)
+    print("LightMem initialized in sweep thread.")
 
 
 # ============================================================
@@ -1055,7 +1060,12 @@ def download_csv(n_clicks):
 # ============================================================
 
 def main():
-    threading.Thread(target=lambda: asyncio.run(run_sweep()), daemon=True).start()
+    def _run_sweep_thread():
+        # Initialize LightMemory in the same thread that executes asyncio workers.
+        _init_memory_for_sweep_thread()
+        asyncio.run(run_sweep())
+
+    threading.Thread(target=_run_sweep_thread, daemon=True).start()
     app.run(host="0.0.0.0", port=CONFIG["dashboard_port"], debug=False)
 
 

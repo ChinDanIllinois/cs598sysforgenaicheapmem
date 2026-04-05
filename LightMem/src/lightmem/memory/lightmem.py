@@ -525,11 +525,12 @@ class LightMemory:
         )
 
         t_db_start = time.perf_counter()
-        loop = asyncio.get_event_loop()
+        # Keep retriever writes on the same thread where LightMemory/Qdrant was created.
+        # Offloading these calls to a thread pool can trigger SQLite thread-affinity errors.
         if self.config.update == "online":
-            await loop.run_in_executor(self.executor, lambda: self.online_update(memory_entries))
+            self.online_update(memory_entries)
         elif self.config.update == "offline":
-            await loop.run_in_executor(self.executor, lambda: self.offline_update(memory_entries))
+            self.offline_update(memory_entries)
         t_db_end = time.perf_counter()
         self.token_stats["stage_db_insert_time"] = self.token_stats.get("stage_db_insert_time", 0.0) + (t_db_end - t_db_start)
         
