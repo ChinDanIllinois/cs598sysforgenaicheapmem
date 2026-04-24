@@ -4,7 +4,7 @@ import time
 import csv
 import copy
 import statistics
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from lightmem.memory.lightmem import LightMemory
 
@@ -69,6 +69,12 @@ def clone_turn_messages(turn_messages: List[Dict[str, Any]], timestamp: str) -> 
     return copied
 
 
+def config_label(max_items: Optional[int], max_sessions_per_item: Optional[int]) -> str:
+    items_str = "allitems" if max_items is None else f"{max_items}item"
+    sessions_str = "allsessions" if max_sessions_per_item is None else f"{max_sessions_per_item}session"
+    return f"{items_str}_{sessions_str}"
+
+
 # =========================
 # LIGHTMEM CONFIG
 # =========================
@@ -106,7 +112,6 @@ def build_config(collection_name: str, streaming_mode: bool) -> Dict[str, Any]:
         "metadata_generate": False,
         "text_summary": False,
 
-        # Back to Ollama + phi
         "memory_manager": {
             "model_name": "ollama",
             "configs": {
@@ -159,24 +164,36 @@ def load_lightmem(collection_name: str, streaming_mode: bool) -> LightMemory:
 def run_mode(
     data: List[Dict[str, Any]],
     streaming_mode: bool,
-    max_items: int = 5,
-    max_sessions_per_item: int = 10,
+    max_items: Optional[int] = 1,
+    max_sessions_per_item: Optional[int] = 1,
 ) -> Dict[str, Any]:
     mode_name = "streaming" if streaming_mode else "baseline"
-    collection_name = f"bench_{mode_name}_{int(time.time())}"
+    collection_name = f"bench_{mode_name}_{int(time.time() * 1000)}"
     lightmem = load_lightmem(collection_name=collection_name, streaming_mode=streaming_mode)
 
     precompute_latencies: List[float] = []
     add_memory_latencies: List[float] = []
     total_turns = 0
+    total_sessions_used = 0
 
     run_start = time.perf_counter()
 
-    for item in data[:max_items]:
-        sessions = item.get("haystack_sessions", [])[:max_sessions_per_item]
-        timestamps = item.get("haystack_dates", [])
+    selected_items = data[:max_items] if max_items is not None else data
 
-        for session, timestamp in zip(sessions, timestamps):
+    for item in selected_items:
+        all_sessions = item.get("haystack_sessions", [])
+        all_timestamps = item.get("haystack_dates", [])
+
+        if max_sessions_per_item is not None:
+            sessions = all_sessions[:max_sessions_per_item]
+            timestamps = all_timestamps[:max_sessions_per_item]
+        else:
+            sessions = all_sessions
+            timestamps = all_timestamps
+
+        total_sessions_used += len(sessions)
+
+        for session_idx, (session, timestamp) in enumerate(zip(sessions, timestamps)):
             session_copy = copy.deepcopy(session)
 
             while session_copy and session_copy[0]["role"] != "user":
@@ -193,7 +210,9 @@ def run_mode(
                     continue
 
                 turn_messages = clone_turn_messages(turn_messages, timestamp)
-                is_last_turn = (session is sessions[-1] and turn_idx == num_turns - 1)
+                is_last_turn = (
+                    session_idx == len(sessions) - 1 and turn_idx == num_turns - 1
+                )
 
                 if streaming_mode:
                     t_pre = time.perf_counter()
@@ -215,7 +234,10 @@ def run_mode(
 
     return {
         "mode": mode_name,
-        "num_items": len(data) if max_items is None else min(max_items, len(data)),
+        "max_items": max_items,
+        "max_sessions_per_item": max_sessions_per_item,
+        "num_items": len(selected_items),
+        "num_sessions": total_sessions_used,
         "num_turns": total_turns,
         "total_runtime_sec": round(total_runtime, 6),
 
@@ -246,6 +268,33 @@ def run_mode(
     }
 
 
+def run_experiment_pair(
+    data: List[Dict[str, Any]],
+    max_items: Optional[int],
+    max_sessions_per_item: Optional[int],
+) -> List[Dict[str, Any]]:
+    label = config_label(max_items, max_sessions_per_item)
+    print(f"\nRunning config: {label}")
+
+    baseline = run_mode(
+        data=data,
+        streaming_mode=False,
+        max_items=max_items,
+        max_sessions_per_item=max_sessions_per_item,
+    )
+    baseline["experiment"] = label
+
+    streaming = run_mode(
+        data=data,
+        streaming_mode=True,
+        max_items=max_items,
+        max_sessions_per_item=max_sessions_per_item,
+    )
+    streaming["experiment"] = label
+
+    return [baseline, streaming]
+
+
 # =========================
 # OUTPUT
 # =========================
@@ -253,7 +302,13 @@ def run_mode(
 def save_results_csv(rows: List[Dict[str, Any]], path: str) -> None:
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+
+    fieldnames = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -275,40 +330,54 @@ def main():
 
     data = load_dataset(DATA_PATH)
 
-    # Keep small while debugging
-    max_items = None
-    max_sessions_per_item = None
+    # Try several settings.
+    # Adjust this grid however you want.
+    experiment_grid = [
+        {"max_items": 1, "max_sessions_per_item": 1},
+        {"max_items": 1, "max_sessions_per_item": 3},
+        {"max_items": 1, "max_sessions_per_item": 5},
+        {"max_items": 1, "max_sessions_per_item": 9},
+        {"max_items": 2, "max_sessions_per_item": 1},
+        {"max_items": 2, "max_sessions_per_item": 3},
+        {"max_items": 3, "max_sessions_per_item": 3},
+        {"max_items": 100, "max_sessions_per_item": 1},
+        {"max_items": 273, "max_sessions_per_item": 1},
 
-    print("Running baseline benchmark...")
-    baseline = run_mode(
-        data=data,
-        streaming_mode=False,
-        max_items=max_items,
-        max_sessions_per_item=max_sessions_per_item,
-    )
+    ]
 
-    print("Running streaming benchmark...")
-    streaming = run_mode(
-        data=data,
-        streaming_mode=True,
-        max_items=max_items,
-        max_sessions_per_item=max_sessions_per_item,
-    )
+    all_rows: List[Dict[str, Any]] = []
 
-    rows = [baseline, streaming]
+    overall_start = time.perf_counter()
+
+    for exp in experiment_grid:
+        rows = run_experiment_pair(
+            data=data,
+            max_items=exp["max_items"],
+            max_sessions_per_item=exp["max_sessions_per_item"],
+        )
+        all_rows.extend(rows)
+
+    overall_runtime = time.perf_counter() - overall_start
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(RESULTS_DIR, f"benchmark_streaming_precompress_{timestamp}.csv")
-    json_path = os.path.join(RESULTS_DIR, f"benchmark_streaming_precompress_{timestamp}.json")
+    csv_path = os.path.join(
+        RESULTS_DIR,
+        f"benchmark_streaming_precompress_grid_{timestamp}.csv",
+    )
+    json_path = os.path.join(
+        RESULTS_DIR,
+        f"benchmark_streaming_precompress_grid_{timestamp}.json",
+    )
 
-    save_results_csv(rows, csv_path)
-    save_results_json(rows, json_path)
+    save_results_csv(all_rows, csv_path)
+    save_results_json(all_rows, json_path)
 
     print("\n=== Benchmark Results ===")
-    for row in rows:
+    for row in all_rows:
         print(json.dumps(row, indent=2))
 
-    print(f"\nSaved CSV to: {csv_path}")
+    print(f"\nCompleted all runs in {overall_runtime:.2f} sec")
+    print(f"Saved CSV to: {csv_path}")
     print(f"Saved JSON to: {json_path}")
 
 
