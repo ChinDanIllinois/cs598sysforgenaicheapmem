@@ -30,6 +30,7 @@ import plotly.graph_objs as go
 
 import logging
 import flask.cli
+import concurrent.futures
 
 # Suppress Flask / Dash / Werkzeug banner and logs
 flask.cli.show_server_banner = lambda *args: None
@@ -527,10 +528,25 @@ def reset_stats(mem):
     mem.reset_token_statistics()
 
 
-print(f"Initializing LightMem with provider: {CONFIG['provider']} ...")
+print(f"Preparing LightMem with provider: {CONFIG['provider']} ...")
 collection_id = "load_test_" + uuid.uuid4().hex[:8]
-memory = load_lightmem(collection_id)
-print("LightMem initialized.")
+memory = None
+memory_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="lightmem-profiler")
+
+
+def _create_memory_instance() -> LightMemory:
+    return load_lightmem(collection_id)
+
+
+async def _memory_call(fn, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(memory_executor, lambda: fn(*args, **kwargs))
+
+
+async def _init_memory_for_sweep_thread() -> None:
+    global memory
+    memory = await _memory_call(_create_memory_instance)
+    print("LightMem initialized in dedicated worker thread.")
 
 
 # ============================================================
@@ -573,10 +589,9 @@ async def worker(worker_id, concurrency, stop_event):
         with metrics_lock:
             total_attempts += 1
         try:
-            # Respect RPM throttle
             await rate_limiter.wait()
 
-            await asyncio.to_thread(
+            await _memory_call(
                 memory.add_memory,
                 messages=messages,
                 force_segment=True,
@@ -607,7 +622,7 @@ async def run_single_concurrency(concurrency):
     current_concurrency = concurrency
     current_running     = True
 
-    reset_stats(memory)
+    await _memory_call(reset_stats, memory)
     total_writes   = 0
     total_latency  = 0.0
     total_errors   = 0
@@ -652,7 +667,7 @@ async def run_single_concurrency(concurrency):
         avg_latency_sec = (delta_latency / delta_writes) if delta_writes > 0 else 0.0
         errors_per_sec  = delta_errors / interval
 
-        stats     = memory.get_token_statistics()
+        stats = await _memory_call(memory.get_token_statistics)
         llm_calls = stats.get("summary", {}).get("total_llm_calls", 0)
         emb_calls = stats.get("summary", {}).get("total_embedding_calls", 0)
         llm_rate       = llm_calls / elapsed if elapsed > 0 else 0
@@ -674,7 +689,7 @@ async def run_single_concurrency(concurrency):
     await asyncio.gather(*workers)
 
     total_time  = time.perf_counter() - start
-    final_stats = memory.get_token_statistics()
+    final_stats = await _memory_call(memory.get_token_statistics)
 
     final_llm   = final_stats.get("summary", {}).get("total_llm_calls", 0)
     final_llm_t = final_stats.get("summary", {}).get("total_llm_time", 0.0)
@@ -726,6 +741,7 @@ async def run_single_concurrency(concurrency):
 
 async def run_sweep():
     global sweep_finished
+    await _init_memory_for_sweep_thread()
     for c in CONFIG["concurrency_levels"]:
         await run_single_concurrency(c)
     sweep_finished = True
@@ -1109,7 +1125,10 @@ def download_csv(n_clicks):
 # ============================================================
 
 def main():
-    threading.Thread(target=lambda: asyncio.run(run_sweep()), daemon=True).start()
+    def _run_sweep_thread():
+        asyncio.run(run_sweep())
+
+    threading.Thread(target=_run_sweep_thread, daemon=True).start()
     app.run(host="0.0.0.0", port=CONFIG["dashboard_port"], debug=False)
 
 

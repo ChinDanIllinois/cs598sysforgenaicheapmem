@@ -10,10 +10,29 @@ logger = logging.getLogger(__name__)
 class SQLiteManager:
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
-        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._local = threading.local()
         self._lock = threading.Lock()
+        # Admin connection is used for bootstrap/schema operations only.
+        self.connection = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        self.connection.execute("PRAGMA journal_mode=WAL;")
+        self.connection.execute("PRAGMA synchronous=NORMAL;")
         self._migrate_history_table()
         self._create_history_table()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            self._local.conn = conn
+        return conn
+
+    def close_thread_conn(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            del self._local.conn
 
     def _migrate_history_table(self) -> None:
         """
@@ -137,9 +156,10 @@ class SQLiteManager:
         role: Optional[str] = None,
     ) -> None:
         with self._lock:
+            conn = self._get_conn()
             try:
-                self.connection.execute("BEGIN")
-                self.connection.execute(
+                conn.execute("BEGIN")
+                conn.execute(
                     """
                     INSERT INTO history (
                         id, memory_id, old_memory, new_memory, event,
@@ -160,15 +180,16 @@ class SQLiteManager:
                         role,
                     ),
                 )
-                self.connection.execute("COMMIT")
+                conn.execute("COMMIT")
             except Exception as e:
-                self.connection.execute("ROLLBACK")
+                conn.execute("ROLLBACK")
                 logger.error(f"Failed to add history record: {e}")
                 raise
 
     def get_history(self, memory_id: str) -> List[Dict[str, Any]]:
         with self._lock:
-            cur = self.connection.execute(
+            conn = self._get_conn()
+            cur = conn.execute(
                 """
                 SELECT id, memory_id, old_memory, new_memory, event,
                        created_at, updated_at, is_deleted, actor_id, role
@@ -199,17 +220,19 @@ class SQLiteManager:
     def reset(self) -> None:
         """Drop and recreate the history table."""
         with self._lock:
+            conn = self._get_conn()
             try:
-                self.connection.execute("BEGIN")
-                self.connection.execute("DROP TABLE IF EXISTS history")
-                self.connection.execute("COMMIT")
-                self._create_history_table()
+                conn.execute("BEGIN")
+                conn.execute("DROP TABLE IF EXISTS history")
+                conn.execute("COMMIT")
             except Exception as e:
-                self.connection.execute("ROLLBACK")
+                conn.execute("ROLLBACK")
                 logger.error(f"Failed to reset history table: {e}")
                 raise
+        self._create_history_table()
 
     def close(self) -> None:
+        self.close_thread_conn()
         if self.connection:
             self.connection.close()
             self.connection = None
