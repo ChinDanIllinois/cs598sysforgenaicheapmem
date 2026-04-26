@@ -195,7 +195,7 @@ def section(title, graphs, ncols=2):
 # DASHBOARD SETUP
 # ============================================================
 
-app = Dash(__name__)
+app = Dash(__name__, requests_pathname_prefix=os.getenv("DASH_PROXY_PREFIX", "/"))
 app.title = "LightMem Multi-Tenant Dashboard"
 
 app.layout = html.Div([
