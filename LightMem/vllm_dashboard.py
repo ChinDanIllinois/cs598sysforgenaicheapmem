@@ -8,9 +8,11 @@ import time
 from datetime import datetime
 from collections import deque
 from prometheus_client.parser import text_string_to_metric_families
+import dotenv
+dotenv.load_dotenv()
 
 # --- CONFIGURATION ---
-VLLM_METRICS_URL = "http://localhost:8000/metrics"
+VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://localhost:8000/metrics")
 UPDATE_INTERVAL_MS = 2000  # 2 seconds
 MAX_DATA_POINTS = 60  # ~2 minutes of history at 2s intervals
 

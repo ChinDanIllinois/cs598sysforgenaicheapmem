@@ -71,6 +71,7 @@ class LoadTestMetrics:
         self.throughput_records = []
         self.total_completed = 0
         self.total_errors = 0
+        self.total_events = 0
         self.start_time = time.time()
         self.simulation_finished = False
         self.lock = threading.RLock()
@@ -223,7 +224,8 @@ app.layout = html.Div([
         ], ncols=2),
         section("Pipeline Breakdown", [
             card_graph("stage_breakdown"),
-        ], ncols=1),
+            card_graph("sim_progress"),
+        ], ncols=2),
     ], style={"padding": "0 28px 40px"}),
 
     dcc.Interval(id="interval", interval=2000, n_intervals=0),
@@ -236,6 +238,7 @@ app.layout = html.Div([
         Output("event_mix", "figure"),
         Output("active_users", "figure"),
         Output("stage_breakdown", "figure"),
+        Output("sim_progress", "figure"),
         Output("status_badge", "children"),
         Output("sim-info", "children"),
     ],
@@ -247,6 +250,7 @@ def update_metrics(n):
         tput_hist = list(GLOBAL_METRICS.throughput_records)
         finished = GLOBAL_METRICS.simulation_finished
         total_comp = GLOBAL_METRICS.total_completed
+        total_evs = GLOBAL_METRICS.total_events
 
     # 1. Throughput Figure
     fig_tput = go.Figure()
@@ -311,11 +315,36 @@ def update_metrics(n):
                 fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
     fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
 
+    # 6. Simulation Progress
+    fig_prog = go.Figure()
+    if total_evs > 0:
+        progress_pct = (total_comp / total_evs) * 100
+        fig_prog.add_trace(go.Indicator(
+            mode="gauge+number+delta",
+            value=total_comp,
+            delta={'reference': total_evs, 'position': "top", 'increasing': {'color': ACCENT}},
+            title={'text': "Total Progress", 'font': {'size': 14}},
+            gauge={
+                'axis': {'range': [None, total_evs], 'tickwidth': 1, 'tickcolor': TEXT_DIM},
+                'bar': {'color': ACCENT},
+                'bgcolor': "rgba(0,0,0,0)",
+                'borderwidth': 2,
+                'bordercolor': BORDER,
+                'steps': [{'range': [0, total_evs], 'color': CARD_BG}],
+                'threshold': {
+                    'line': {'color': "white", 'width': 4},
+                    'thickness': 0.75,
+                    'value': total_comp
+                }
+            }
+        ))
+    fig_prog.update_layout(title="Events Processed vs Total", height=300, **PLOT_LAYOUT)
+
     # Status Bundle
     status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
-    info = f"Total Events: {total_comp} | Multi-Tenant Simulation v1.0"
+    info = f"Progress: {total_comp}/{total_evs} | Multi-Tenant Simulation v1.0"
 
-    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, status, info
+    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_prog, status, info
 
 # ============================================================
 # CORE LOGIC (Rest of script)
@@ -369,6 +398,7 @@ async def monitor_throughput(metrics, stop_event):
 async def run_simulation(events, args, memory, rate_limiter):
     sem = asyncio.Semaphore(args.concurrency_limit)
     first_ts, start_wall = events[0]["ts"], time.time()
+    GLOBAL_METRICS.total_events = len(events)
     stop_mon = asyncio.Event()
     mon_task = asyncio.create_task(monitor_throughput(GLOBAL_METRICS, stop_mon))
     tasks = []
