@@ -75,7 +75,7 @@ def parse_filename(filepath):
     
     return model, run_name
 
-def create_comparison_graph(csv_paths, output_path="comparison_results.html"):
+def create_comparison_graph(csv_paths, identifiers, output_path="comparison_results.html"):
     # Load all datasets
     runs = []
     for p in csv_paths:
@@ -87,7 +87,11 @@ def create_comparison_graph(csv_paths, output_path="comparison_results.html"):
         df.columns = df.columns.str.strip()
         
         model, run_name = parse_filename(p)
-        batch_type = "Batch" if "with-batch" in run_name.lower() else "Base"
+        batch_type = "Base"
+        for identifier in identifiers:
+            if identifier.lower() in run_name.lower():
+                batch_type = identifier
+                break
         
         runs.append({
             "model": model,
@@ -136,7 +140,14 @@ def create_comparison_graph(csv_paths, output_path="comparison_results.html"):
         display_model = shorten_model_name(model)
 
         for run in model_runs:
-            dash = "dash" if "Batch" in run["batch_type"] else None
+            # If batch_type matches any of our custom identifiers, use dashed line
+            dash = None
+            if isinstance(identifiers, list):
+                if any(i.lower() in run["batch_type"].lower() for i in identifiers):
+                    dash = "dash"
+            elif isinstance(identifiers, str) and identifiers.lower() in run["batch_type"].lower():
+                dash = "dash"
+            
             width = 3 if dash else 4
             color = color_map[model]
             
@@ -186,6 +197,14 @@ if __name__ == "__main__":
         nargs="*",
         help="List of CSV files to compare."
     )
+
+    parser.add_argument(
+        "--identifiers",
+        nargs="*",
+        type=str,
+        default=["Batch", "adaptive-batching", "with-batch"],
+        help="Identifier in the run name to distinguish between runs."
+    )
     parser.add_argument(
         "--output",
         type=str,
@@ -199,4 +218,4 @@ if __name__ == "__main__":
         print("No CSV files provided.")
         sys.exit(1)
         
-    create_comparison_graph(args.csvs, args.output)
+    create_comparison_graph(args.csvs, args.identifiers, args.output)

@@ -493,6 +493,8 @@ class LightMemory:
                         continue
 
                     _t_llm_extract = _time.perf_counter() - _t0
+                    with tenant.lock:
+                        tenant.token_stats["stage_llm_extract_time"] += _t_llm_extract
                     result_dict = {"add_input_prompt": [], "add_output_prompt": [], "api_call_nums": 0}
                     process_extraction_results(
                         extracted_results=extracted_results,
@@ -523,6 +525,8 @@ class LightMemory:
                 elif self.config.update == "offline":
                     self.offline_update(memory_entries)
                 _t_db_insert = _time.perf_counter() - _t0
+                with tenant.lock:
+                    tenant.token_stats["stage_db_insert_time"] += _t_db_insert
                 
                 job.future.set_result(True)
                 self.extraction_queue.task_done()
