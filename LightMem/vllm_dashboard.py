@@ -1,4 +1,5 @@
 import dash
+import os
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
@@ -128,7 +129,7 @@ def parse_vllm_metrics():
         return None
 
 # --- DASH APP ---
-app = dash.Dash(__name__, external_stylesheets=EXTERNAL_STYLESHEETS)
+app = dash.Dash(__name__, external_stylesheets=EXTERNAL_STYLESHEETS, requests_pathname_prefix=os.getenv("DASH_PROXY_PREFIX", "/"))
 
 app.index_string = f'''
 <!DOCTYPE html>
