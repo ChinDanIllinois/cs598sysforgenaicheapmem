@@ -127,6 +127,7 @@ def parse_args():
     parser.add_argument("--llm-batch-timeout", type=int, default=10)
     parser.add_argument("--vllm-adaptive-shaping", action="store_true")
     parser.add_argument("--vllm-metrics-url", type=str, default="")
+    parser.add_argument("--vllm-embed-url", type=str, default="", help="vLLM endpoint for embedding model.")
     parser.add_argument("--rpm", type=float, default=0.0, metavar="RPM")
     
     # Multi-Tenant Simulation Control
@@ -421,11 +422,50 @@ async def run_simulation(events, args, memory, rate_limiter):
 def setup_lightmem(args):
     builder = _BUILDERS.get(args.provider)
     cfg = builder(args)
+    
+    # Performance choices: vLLM backend gets GPU for local models or remote endpoints
+    device = "cuda" if args.provider == "vllm" else "cpu"
+    
+    # Configure Embedder
+    if args.provider == "vllm" and args.vllm_embed_url:
+        # Use remote vLLM for embeddings
+        embedder_cfg = {
+            "model_name": "openai",
+            "configs": {
+                "model": os.getenv("EMBEDDING_MODEL_PATH"),
+                "api_key": "EMPTY",
+                "base_url": args.vllm_embed_url,
+                "embedding_dims": 384
+            }
+        }
+    else:
+        # Use local HuggingFace (GPU if vllm provider, else CPU)
+        embedder_cfg = {
+            "model_name": "huggingface", 
+            "configs": {
+                "model": os.getenv("EMBEDDING_MODEL_PATH"), 
+                "embedding_dims": 384, 
+                "model_kwargs": {"device": device}
+            }
+        }
+
     return LightMemory.from_config({
-        "pre_compress": True, "pre_compressor": {"model_name": "llmlingua-2", "configs": {"llmlingua_config": {"model_name": os.getenv("LLMLINGUA_MODEL_PATH"), "device_map": "cpu", "use_llmlingua2": True}, "compress_config": {"rate": 0.6}}},
+        "pre_compress": True, 
+        "pre_compressor": {
+            "model_name": "llmlingua-2", 
+            "configs": {
+                "llmlingua_config": {
+                    "model_name": os.getenv("LLMLINGUA_MODEL_PATH"), 
+                    "device_map": device, 
+                    "use_llmlingua2": True
+                }, 
+                "compress_config": {"rate": 0.6}
+            }
+        },
         "topic_segment": True, "precomp_topic_shared": True, "topic_segmenter": {"model_name": "llmlingua-2"},
         "messages_use": "user_only", "metadata_generate": True, "text_summary": True, "memory_manager": cfg, "extract_threshold": 0.1,
-        "index_strategy": "embedding", "text_embedder": {"model_name": "huggingface", "configs": {"model": os.getenv("EMBEDDING_MODEL_PATH"), "embedding_dims": 384, "model_kwargs": {"device": "cpu"}}},
+        "index_strategy": "embedding", 
+        "text_embedder": embedder_cfg,
         "retrieve_strategy": "embedding", "embedding_retriever": {"model_name": "qdrant", "configs": {"collection_name": f"mt_{uuid.uuid4().hex[:4]}", "embedding_model_dims": 384, "path": f"{os.getenv('QDRANT_DATA_DIR')}/multitenant"}},
         "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "INFO"}
     })
