@@ -390,11 +390,15 @@ async def run_simulation(events, args, memory, rate_limiter):
                 else:
                     await asyncio.to_thread(memory.retrieve_memory, query=event["content"], user_id=event["user_id"])
                 
-                # Protect stats collection and reset
+                # Protect stats collection and reset as an ATOMIC operation
                 with GLOBAL_METRICS.lock:
                     stats = memory.get_token_statistics()
-                    stage_timings = stats.get("stage_timings")
+                    # Capture the stages. If LightMem returns them, they'll be in stage_timings
+                    stage_timings = stats.get("stage_timings", {})
+                    if stage_timings:
+                        stage_timings = stage_timings.copy()
                     memory.reset_token_statistics()
+                    
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success", stage_timings)
                     
             except Exception as e:
