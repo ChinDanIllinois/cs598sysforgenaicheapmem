@@ -10,6 +10,7 @@ from collections import deque
 from prometheus_client.parser import text_string_to_metric_families
 import dotenv
 dotenv.load_dotenv()
+port = os.getenv("DASH_PORT", 8050)
 
 # --- CONFIGURATION ---
 VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://localhost:8000/metrics")
@@ -131,7 +132,12 @@ def parse_vllm_metrics():
         return None
 
 # --- DASH APP ---
-app = dash.Dash(__name__, external_stylesheets=EXTERNAL_STYLESHEETS, requests_pathname_prefix=os.getenv("DASH_PROXY_PREFIX", "/"))
+prefix_str = os.getenv("DASH_PROXY_PREFIX", "/").strip("/")
+requests_pathname_prefix = "/" + "/".join([prefix_str, str(port)]) if prefix_str else f"/{port}/"
+
+print(f"Serving Dash app at {requests_pathname_prefix}")
+
+app = dash.Dash(__name__, external_stylesheets=EXTERNAL_STYLESHEETS, requests_pathname_prefix=requests_pathname_prefix)
 
 app.index_string = f'''
 <!DOCTYPE html>
@@ -424,6 +430,5 @@ def update_dashboard(n):
     )
 
 if __name__ == '__main__':
-    print("Starting vLLM Monitoring Dashboard on http://localhost:8050")
-    print(f"Polling vLLM Metrics at: {VLLM_METRICS_URL}")
-    app.run(debug=True, port=8050)
+    print(f"Serving vLLM Dashboard at http://localhost:{requests_pathname_prefix}")
+    app.run(debug=True, port=port)
