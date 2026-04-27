@@ -201,12 +201,12 @@ def section(title, graphs, ncols=2):
 
 
 
+def create_dash_app(requests_pathname_prefix: str):
+    app = Dash(__name__,requests_pathname_prefix=requests_pathname_prefix)
+    app.title = "LightMem Multi-Tenant Dashboard"
 
-app = Dash(__name__)
-app.title = "LightMem Multi-Tenant Dashboard"
-
-app.layout = html.Div([
-    # Header
+    app.layout = html.Div([
+        # Header
     html.Div([
         html.Div([
             html.Span("🏢", style={"fontSize": "26px", "marginRight": "12px"}),
@@ -238,134 +238,136 @@ app.layout = html.Div([
     ], style={"padding": "0 28px 40px"}),
 
     dcc.Interval(id="interval", interval=2000, n_intervals=0),
-], style={"backgroundColor": BG, "minHeight": "100vh", "fontFamily": "Inter, sans-serif"})
+    ], style={"backgroundColor": BG, "minHeight": "100vh", "fontFamily": "Inter, sans-serif"})
 
-@app.callback(
-    [
-        Output("live_throughput", "figure"),
-        Output("live_latency", "figure"),
-        Output("event_mix", "figure"),
-        Output("active_users", "figure"),
-        Output("stage_breakdown", "figure"),
-        Output("live_backlog", "figure"),
-        Output("sim_progress", "figure"),
-        Output("status_badge", "children"),
-        Output("sim-info", "children"),
-    ],
-    [Input("interval", "n_intervals")]
-)
-def update_metrics(n):
-    with GLOBAL_METRICS.lock:
-        data = list(GLOBAL_METRICS.results)
-        tput_hist = list(GLOBAL_METRICS.throughput_records)
-        backlog_hist = list(GLOBAL_METRICS.queue_depth_history)
-        finished = GLOBAL_METRICS.simulation_finished
-        total_comp = GLOBAL_METRICS.total_completed
-        total_evs = GLOBAL_METRICS.total_events
+    @app.callback(
+        [
+            Output("live_throughput", "figure"),
+            Output("live_latency", "figure"),
+            Output("event_mix", "figure"),
+            Output("active_users", "figure"),
+            Output("stage_breakdown", "figure"),
+            Output("live_backlog", "figure"),
+            Output("sim_progress", "figure"),
+            Output("status_badge", "children"),
+            Output("sim-info", "children"),
+        ],
+        [Input("interval", "n_intervals")]
+    )
+    def update_metrics(n):
+        with GLOBAL_METRICS.lock:
+            data = list(GLOBAL_METRICS.results)
+            tput_hist = list(GLOBAL_METRICS.throughput_records)
+            backlog_hist = list(GLOBAL_METRICS.queue_depth_history)
+            finished = GLOBAL_METRICS.simulation_finished
+            total_comp = GLOBAL_METRICS.total_completed
+            total_evs = GLOBAL_METRICS.total_events
 
-    # 1. Throughput Figure
-    fig_tput = go.Figure()
-    if tput_hist:
-        tx = [r["elapsed_sec"] for r in tput_hist]
-        ty = [r["throughput_eps"] for r in tput_hist]
-        fig_tput.add_trace(make_scatter(tx, ty, ACCENT, "EPS", fill="tozeroy"))
-    fig_tput.update_layout(title="Throughput (Events Per Second)", **PLOT_LAYOUT)
+        # 1. Throughput Figure
+        fig_tput = go.Figure()
+        if tput_hist:
+            tx = [r["elapsed_sec"] for r in tput_hist]
+            ty = [r["throughput_eps"] for r in tput_hist]
+            fig_tput.add_trace(make_scatter(tx, ty, ACCENT, "EPS", fill="tozeroy"))
+        fig_tput.update_layout(title="Throughput (Events Per Second)", **PLOT_LAYOUT)
 
-    # 2. Latency Figure (Rolling P50/P99)
-    fig_lat = go.Figure()
-    if data:
-        # Group by 5s windows for percentiles
-        df = pd.DataFrame(data)
-        df["win"] = (df["wall_time"] // 5) * 5
-        win_groups = df.groupby("win")["latency"].agg([lambda x: np.percentile(x, 50), lambda x: np.percentile(x, 95), lambda x: np.percentile(x, 99)]).reset_index()
-        win_groups.columns = ["win", "p50", "p95", "p99"]
-        
-        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p50"], ACCENT2, "P50 Latency"))
-        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p95"], ACCENT3, "P95 Latency", dash="dot"))
-        fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p99"], ACCENT_ERR, "P99 Latency", dash="dash"))
-    fig_lat.update_layout(title="Latency Trends (P50/P95/P99)", **PLOT_LAYOUT)
+        # 2. Latency Figure (Rolling P50/P99)
+        fig_lat = go.Figure()
+        if data:
+            # Group by 5s windows for percentiles
+            df = pd.DataFrame(data)
+            df["win"] = (df["wall_time"] // 5) * 5
+            win_groups = df.groupby("win")["latency"].agg([lambda x: np.percentile(x, 50), lambda x: np.percentile(x, 95), lambda x: np.percentile(x, 99)]).reset_index()
+            win_groups.columns = ["win", "p50", "p95", "p99"]
+            
+            fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p50"], ACCENT2, "P50 Latency"))
+            fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p95"], ACCENT3, "P95 Latency", dash="dot"))
+            fig_lat.add_trace(make_scatter(win_groups["win"], win_groups["p99"], ACCENT_ERR, "P99 Latency", dash="dash"))
+        fig_lat.update_layout(title="Latency Trends (P50/P95/P99)", **PLOT_LAYOUT)
 
-    # 3. Request Mix (Archive vs Query)
-    fig_mix = go.Figure()
-    if data:
-        df = pd.DataFrame(data)
-        df["win"] = (df["wall_time"] // 5) * 5
-        mix = df.groupby(["win", "type"]).size().unstack(fill_value=0).reset_index()
-        if "archive" in mix.columns:
-            fig_mix.add_trace(make_scatter(mix["win"], mix["archive"], ACCENT, "Archives (Writes)", fill="tozeroy"))
-        if "query" in mix.columns:
-            fig_mix.add_trace(make_scatter(mix["win"], mix["query"], ACCENT2, "Queries (Reads)", fill="tonexty"))
-    fig_mix.update_layout(title="Request Mix (Writes vs Reads)", **PLOT_LAYOUT)
+        # 3. Request Mix (Archive vs Query)
+        fig_mix = go.Figure()
+        if data:
+            df = pd.DataFrame(data)
+            df["win"] = (df["wall_time"] // 5) * 5
+            mix = df.groupby(["win", "type"]).size().unstack(fill_value=0).reset_index()
+            if "archive" in mix.columns:
+                fig_mix.add_trace(make_scatter(mix["win"], mix["archive"], ACCENT, "Archives (Writes)", fill="tozeroy"))
+            if "query" in mix.columns:
+                fig_mix.add_trace(make_scatter(mix["win"], mix["query"], ACCENT2, "Queries (Reads)", fill="tonexty"))
+        fig_mix.update_layout(title="Request Mix (Writes vs Reads)", **PLOT_LAYOUT)
 
-    # 4. Active Users (Cumulative)
-    fig_users = go.Figure()
-    if data:
-        df = pd.DataFrame(data)
-        df["win"] = (df["wall_time"] // 5) * 5
-        unique_users = []
-        user_timeline = df.sort_values("wall_time")
-        seen = set()
-        current_win = -1
-        for _, r in user_timeline.iterrows():
-            seen.add(r["user_id"])
-            w = (r["wall_time"] // 5) * 5
-            if w > current_win:
-                unique_users.append((w, len(seen)))
-                current_win = w
-        ux, uy = zip(*unique_users) if unique_users else ([], [])
-        fig_users.add_trace(make_scatter(ux, uy, ACCENT4, "Total Unique Tenants", fill="tozeroy"))
-    fig_users.update_layout(title="Tenant Saturation (Unique Users)", **PLOT_LAYOUT)
+        # 4. Active Users (Cumulative)
+        fig_users = go.Figure()
+        if data:
+            df = pd.DataFrame(data)
+            df["win"] = (df["wall_time"] // 5) * 5
+            unique_users = []
+            user_timeline = df.sort_values("wall_time")
+            seen = set()
+            current_win = -1
+            for _, r in user_timeline.iterrows():
+                seen.add(r["user_id"])
+                w = (r["wall_time"] // 5) * 5
+                if w > current_win:
+                    unique_users.append((w, len(seen)))
+                    current_win = w
+            ux, uy = zip(*unique_users) if unique_users else ([], [])
+            fig_users.add_trace(make_scatter(ux, uy, ACCENT4, "Total Unique Tenants", fill="tozeroy"))
+        fig_users.update_layout(title="Tenant Saturation (Unique Users)", **PLOT_LAYOUT)
 
-    # 5. Pipeline Stages
-    fig_sb = go.Figure()
-    if data:
-        df = pd.DataFrame(data)
-        stages = [("stage_compress", "Compress", ACCENT), ("stage_segment", "Segment", ACCENT2), ("stage_llm_extract", "LLM Extract", ACCENT3), ("stage_db_insert", "DB Insert", ACCENT4)]
-        for k, label, color in stages:
-            if k in df.columns:
-                fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
-    fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
+        # 5. Pipeline Stages
+        fig_sb = go.Figure()
+        if data:
+            df = pd.DataFrame(data)
+            stages = [("stage_compress", "Compress", ACCENT), ("stage_segment", "Segment", ACCENT2), ("stage_llm_extract", "LLM Extract", ACCENT3), ("stage_db_insert", "DB Insert", ACCENT4)]
+            for k, label, color in stages:
+                if k in df.columns:
+                    fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
+        fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
 
-    # 6. Backlog Figure
-    fig_backlog = go.Figure()
-    if backlog_hist:
-        bx = [r["elapsed_sec"] for r in backlog_hist]
-        by_arch = [r["archives"] for r in backlog_hist]
-        by_q = [r["queries"] for r in backlog_hist]
-        fig_backlog.add_trace(make_scatter(bx, by_arch, ACCENT, "Queued Writes (Archives)", fill="tozeroy"))
-        fig_backlog.add_trace(make_scatter(bx, by_q, ACCENT2, "Queued Reads (Queries)", fill="tonexty"))
-    fig_backlog.update_layout(title="Active Backlog (In-Flight Requests)", **PLOT_LAYOUT)
+        # 6. Backlog Figure
+        fig_backlog = go.Figure()
+        if backlog_hist:
+            bx = [r["elapsed_sec"] for r in backlog_hist]
+            by_arch = [r["archives"] for r in backlog_hist]
+            by_q = [r["queries"] for r in backlog_hist]
+            fig_backlog.add_trace(make_scatter(bx, by_arch, ACCENT, "Queued Writes (Archives)", fill="tozeroy"))
+            fig_backlog.add_trace(make_scatter(bx, by_q, ACCENT2, "Queued Reads (Queries)", fill="tonexty"))
+        fig_backlog.update_layout(title="Active Backlog (In-Flight Requests)", **PLOT_LAYOUT)
 
-    # 7. Simulation Progress
-    fig_prog = go.Figure()
-    if total_evs > 0:
-        progress_pct = (total_comp / total_evs) * 100
-        fig_prog.add_trace(go.Indicator(
-            mode="gauge+number+delta",
-            value=total_comp,
-            delta={'reference': total_evs, 'position': "top", 'increasing': {'color': ACCENT}},
-            title={'text': "Total Progress", 'font': {'size': 14}},
-            gauge={
-                'axis': {'range': [None, total_evs], 'tickwidth': 1, 'tickcolor': TEXT_DIM},
-                'bar': {'color': ACCENT},
-                'bgcolor': "rgba(0,0,0,0)",
-                'borderwidth': 2,
-                'bordercolor': BORDER,
-                'steps': [{'range': [0, total_evs], 'color': CARD_BG}],
-                'threshold': {
-                    'line': {'color': "white", 'width': 4},
-                    'thickness': 0.75,
-                    'value': total_comp
+        # 7. Simulation Progress
+        fig_prog = go.Figure()
+        if total_evs > 0:
+            progress_pct = (total_comp / total_evs) * 100
+            fig_prog.add_trace(go.Indicator(
+                mode="gauge+number+delta",
+                value=total_comp,
+                delta={'reference': total_evs, 'position': "top", 'increasing': {'color': ACCENT}},
+                title={'text': "Total Progress", 'font': {'size': 14}},
+                gauge={
+                    'axis': {'range': [None, total_evs], 'tickwidth': 1, 'tickcolor': TEXT_DIM},
+                    'bar': {'color': ACCENT},
+                    'bgcolor': "rgba(0,0,0,0)",
+                    'borderwidth': 2,
+                    'bordercolor': BORDER,
+                    'steps': [{'range': [0, total_evs], 'color': CARD_BG}],
+                    'threshold': {
+                        'line': {'color': "white", 'width': 4},
+                        'thickness': 0.75,
+                        'value': total_comp
+                    }
                 }
-            }
-        ))
-    fig_prog.update_layout(title="Events Processed vs Total", height=300, **PLOT_LAYOUT)
+            ))
+        fig_prog.update_layout(title="Events Processed vs Total", height=300, **PLOT_LAYOUT)
 
-    # Status Bundle
-    status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
-    info = f"Progress: {total_comp}/{total_evs} | Multi-Tenant Simulation v1.0"
+        # Status Bundle
+        status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
+        info = f"Progress: {total_comp}/{total_evs} | Multi-Tenant Simulation v1.0"
 
-    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_backlog, fig_prog, status, info
+        return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_backlog, fig_prog, status, info
+    
+    return app
 
 # ============================================================
 # CORE LOGIC (Rest of script)
@@ -597,8 +599,7 @@ def main_cli():
     prefix_str = os.getenv("DASH_PROXY_PREFIX", "/").strip("/")
     requests_pathname_prefix = "/" + "/".join([prefix_str, str(args.port)]) if prefix_str else f"/{args.port}"
     requests_pathname_prefix =requests_pathname_prefix+ "/"
-    
-    app.config.requests_pathname_prefix = requests_pathname_prefix
+    app = create_dash_app(requests_pathname_prefix=requests_pathname_prefix)
     app.run(host="0.0.0.0", port=args.port, debug=False)
 
 if __name__ == "__main__":
