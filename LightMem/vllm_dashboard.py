@@ -133,7 +133,8 @@ def parse_vllm_metrics():
 
 # --- DASH APP ---
 prefix_str = os.getenv("DASH_PROXY_PREFIX", "/").strip("/")
-requests_pathname_prefix = "/" + "/".join([prefix_str, str(port)]) if prefix_str else f"/{port}/"
+requests_pathname_prefix = "/" + "/".join([prefix_str, str(port)]) if prefix_str else f"/{port}"
+requests_pathname_prefix =requests_pathname_prefix+ "/"
 
 print(f"Serving Dash app at {requests_pathname_prefix}")
 
