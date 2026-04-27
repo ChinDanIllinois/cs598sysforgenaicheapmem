@@ -72,6 +72,9 @@ class LoadTestMetrics:
         self.total_completed = 0
         self.total_errors = 0
         self.total_events = 0
+        self.active_archives = 0
+        self.active_queries = 0
+        self.queue_depth_history = []
         self.start_time = time.time()
         self.simulation_finished = False
         self.lock = threading.RLock()
@@ -222,10 +225,13 @@ app.layout = html.Div([
             card_graph("event_mix"),
             card_graph("active_users"),
         ], ncols=2),
-        section("Pipeline Breakdown", [
+        section("Pipeline & Backlog", [
             card_graph("stage_breakdown"),
-            card_graph("sim_progress"),
+            card_graph("live_backlog"),
         ], ncols=2),
+        section("Simulation Progress", [
+            card_graph("sim_progress"),
+        ], ncols=1),
     ], style={"padding": "0 28px 40px"}),
 
     dcc.Interval(id="interval", interval=2000, n_intervals=0),
@@ -238,6 +244,7 @@ app.layout = html.Div([
         Output("event_mix", "figure"),
         Output("active_users", "figure"),
         Output("stage_breakdown", "figure"),
+        Output("live_backlog", "figure"),
         Output("sim_progress", "figure"),
         Output("status_badge", "children"),
         Output("sim-info", "children"),
@@ -248,6 +255,7 @@ def update_metrics(n):
     with GLOBAL_METRICS.lock:
         data = list(GLOBAL_METRICS.results)
         tput_hist = list(GLOBAL_METRICS.throughput_records)
+        backlog_hist = list(GLOBAL_METRICS.queue_depth_history)
         finished = GLOBAL_METRICS.simulation_finished
         total_comp = GLOBAL_METRICS.total_completed
         total_evs = GLOBAL_METRICS.total_events
@@ -315,7 +323,17 @@ def update_metrics(n):
                 fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
     fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
 
-    # 6. Simulation Progress
+    # 6. Backlog Figure
+    fig_backlog = go.Figure()
+    if backlog_hist:
+        bx = [r["elapsed_sec"] for r in backlog_hist]
+        by_arch = [r["archives"] for r in backlog_hist]
+        by_q = [r["queries"] for r in backlog_hist]
+        fig_backlog.add_trace(make_scatter(bx, by_arch, ACCENT, "Queued Writes (Archives)", fill="tozeroy"))
+        fig_backlog.add_trace(make_scatter(bx, by_q, ACCENT2, "Queued Reads (Queries)", fill="tonexty"))
+    fig_backlog.update_layout(title="Active Backlog (In-Flight Requests)", **PLOT_LAYOUT)
+
+    # 7. Simulation Progress
     fig_prog = go.Figure()
     if total_evs > 0:
         progress_pct = (total_comp / total_evs) * 100
@@ -344,7 +362,7 @@ def update_metrics(n):
     status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
     info = f"Progress: {total_comp}/{total_evs} | Multi-Tenant Simulation v1.0"
 
-    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_prog, status, info
+    return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_backlog, fig_prog, status, info
 
 # ============================================================
 # CORE LOGIC (Rest of script)
@@ -392,8 +410,9 @@ async def monitor_throughput(metrics, stop_event):
             delta, dt = cur - last_count, now - last_time
             tput = delta / dt if dt > 0 else 0
             metrics.throughput_records.append({"elapsed_sec": now - metrics.start_time, "throughput_eps": tput, "completed_so_far": cur, "errors_so_far": err})
+            metrics.queue_depth_history.append({"elapsed_sec": now - metrics.start_time, "archives": metrics.active_archives, "queries": metrics.active_queries})
             last_count, last_time = cur, now
-            print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Total: {cur:5}")
+            print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Backlog: {metrics.active_archives + metrics.active_queries:3} | Total: {cur:5}")
 
 async def run_simulation(events, args, memory, rate_limiter):
     sem = asyncio.Semaphore(args.concurrency_limit)
@@ -413,6 +432,10 @@ async def run_simulation(events, args, memory, rate_limiter):
             async with sem:
                 await rate_limiter.wait()
             st = time.perf_counter()
+            is_archive = event["type"] == "archive"
+            with GLOBAL_METRICS.lock:
+                if is_archive: GLOBAL_METRICS.active_archives += 1
+                else: GLOBAL_METRICS.active_queries += 1
             try:
                 if event["type"] == "archive":
                     res = await asyncio.to_thread(memory.add_memory, messages=event["content"], user_id=event["user_id"], force_segment=True, force_extract=True)
@@ -437,6 +460,10 @@ async def run_simulation(events, args, memory, rate_limiter):
                 print(f"Error in {event['type']} for user {event['user_id']}: {e}")
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], 0, "error")
+            finally:
+                with GLOBAL_METRICS.lock:
+                    if is_archive: GLOBAL_METRICS.active_archives -= 1
+                    else: GLOBAL_METRICS.active_queries -= 1
 
     for i, ev in enumerate(events):
         delay = start_wall + ((ev["ts"] - first_ts) / args.time_scale) - time.time()
@@ -497,7 +524,8 @@ def setup_lightmem(args):
         "index_strategy": "embedding", 
         "text_embedder": embedder_cfg,
         "retrieve_strategy": "embedding", "embedding_retriever": {"model_name": "qdrant", "configs": {"collection_name": f"mt_{uuid.uuid4().hex[:4]}", "embedding_model_dims": 384, "path": f"{os.getenv('QDRANT_DATA_DIR')}/multitenant"}},
-        "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "INFO"}
+        "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "INFO"},
+        "extraction_concurrency": args.concurrency_limit
     })
 
 _BUILDERS = {

@@ -455,84 +455,96 @@ class LightMemory:
         return None
 
     def _batch_worker(self):
-        import time as _time
-        self.logger.info("Batch worker thread started. Listening for extraction jobs.")
-        while True:
-            try:
+        self.logger.info("Batch worker dispatcher started. Listening for extraction jobs.")
+        # Parallel dispatcher allows multiple tenants to trigger extraction simultaneously
+        # which then coalesces in the shared VllmBatchProcessor.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.extraction_concurrency) as executor:
+            while True:
                 job = self.extraction_queue.get()
                 if job is None:
+                    executor.shutdown(wait=True)
                     break
-                call_id = f"worker_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                self.logger.info(f"========== START {call_id} ==========")
-                self.logger.info(f"[{call_id}] Processing background extraction for User: {job.user_id}")
-                
-                extract_list = job.extract_list
-                topic_id_mapping = job.topic_id_mapping
-                tenant = self._get_tenant(job.user_id)
-                
-                extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
-                max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
-                
-                extracted_results = []
-                _t0 = _time.perf_counter()
-                if self.config.metadata_generate and self.config.text_summary:
-                    try:
-                        extracted_results = self.manager.meta_text_extract(
-                            extract_list=extract_list,
-                            messages_use=self.config.messages_use,
-                            topic_id_mapping=topic_id_mapping,
-                            extraction_mode=self.config.extraction_mode,
-                            custom_prompts=None  
-                        )
-                    except Exception as e:
-                        with tenant.lock:
-                            tenant.token_stats["add_memory_errors"] += 1
-                        self.logger.error(f"[{call_id}] Background extraction failed: {e}")
-                        job.future.set_exception(e)
-                        self.extraction_queue.task_done()
-                        continue
+                executor.submit(self._process_extraction_job, job)
 
-                    _t_llm_extract = _time.perf_counter() - _t0
-                    with tenant.lock:
-                        tenant.token_stats["stage_llm_extract_time"] += _t_llm_extract
-                    result_dict = {"add_input_prompt": [], "add_output_prompt": [], "api_call_nums": 0}
-                    process_extraction_results(
-                        extracted_results=extracted_results,
-                        token_stats=tenant.token_stats,
-                        result_dict=result_dict,
-                        call_id=call_id,
-                        logger=self.logger,
-                        lock=tenant.lock
+    def _process_extraction_job(self, job):
+        import time as _time
+        try:
+            call_id = f"worker_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            self.logger.info(f"========== START {call_id} ==========")
+            self.logger.info(f"[{call_id}] Processing background extraction for User: {job.user_id}")
+            
+            extract_list = job.extract_list
+            topic_id_mapping = job.topic_id_mapping
+            tenant = self._get_tenant(job.user_id)
+            
+            extract_list, timestamps_list, weekday_list, speaker_list, topic_id_map = assign_sequence_numbers_with_timestamps(extract_list, offset_ms=500, topic_id_mapping=topic_id_mapping)
+            max_source_ids = [sum(1 for seg in batch for msg in seg if msg.get("role") == "user") - 1 for batch in extract_list]
+            
+            extracted_results = []
+            _t0 = _time.perf_counter()
+            if self.config.metadata_generate and self.config.text_summary:
+                try:
+                    extracted_results = self.manager.meta_text_extract(
+                        extract_list=extract_list,
+                        messages_use=self.config.messages_use,
+                        topic_id_mapping=topic_id_mapping,
+                        extraction_mode=self.config.extraction_mode,
+                        custom_prompts=None  
                     )
+                except Exception as e:
+                    with tenant.lock:
+                        tenant.token_stats["add_memory_errors"] += 1
+                    self.logger.error(f"[{call_id}] Background extraction failed: {e}")
+                    job.future.set_exception(e)
+                    return
+                finally:
+                    # We always call task_done in the outer finally block
+                    pass
 
-                memory_entries = convert_extraction_results_to_memory_entries(
-                    extracted_results=extracted_results,
-                    timestamps_list=timestamps_list,
-                    weekday_list=weekday_list,
-                    speaker_list=speaker_list,
-                    topic_id_map=topic_id_map,
-                    max_source_ids=max_source_ids,
-                    logger=self.logger
-                )
-                
-                # Assign user_id to all generated MemoryEntry objects
-                for mem in memory_entries:
-                    mem.user_id = job.user_id
-
-                _t0 = _time.perf_counter()
-                if self.config.update == "online":
-                    self.online_update(memory_entries)
-                elif self.config.update == "offline":
-                    self.offline_update(memory_entries)
-                _t_db_insert = _time.perf_counter() - _t0
+                _t_llm_extract = _time.perf_counter() - _t0
                 with tenant.lock:
-                    tenant.token_stats["stage_db_insert_time"] += _t_db_insert
-                
-                job.future.set_result(True)
-                self.extraction_queue.task_done()
-                self.logger.info(f"========== END {call_id} ==========")
-            except Exception as e:
-                self.logger.error(f"Batch worker encoutered fatal error: {e}")
+                    tenant.token_stats["stage_llm_extract_time"] += _t_llm_extract
+                result_dict = {"add_input_prompt": [], "add_output_prompt": [], "api_call_nums": 0}
+                process_extraction_results(
+                    extracted_results=extracted_results,
+                    token_stats=tenant.token_stats,
+                    result_dict=result_dict,
+                    call_id=call_id,
+                    logger=self.logger,
+                    lock=tenant.lock
+                )
+
+            memory_entries = convert_extraction_results_to_memory_entries(
+                extracted_results=extracted_results,
+                timestamps_list=timestamps_list,
+                weekday_list=weekday_list,
+                speaker_list=speaker_list,
+                topic_id_map=topic_id_map,
+                max_source_ids=max_source_ids,
+                logger=self.logger
+            )
+            
+            # Assign user_id to all generated MemoryEntry objects
+            for mem in memory_entries:
+                mem.user_id = job.user_id
+
+            _t0 = _time.perf_counter()
+            if self.config.update == "online":
+                self.online_update(memory_entries)
+            elif self.config.update == "offline":
+                self.offline_update(memory_entries)
+            _t_db_insert = _time.perf_counter() - _t0
+            with tenant.lock:
+                tenant.token_stats["stage_db_insert_time"] += _t_db_insert
+            
+            job.future.set_result(True)
+            self.logger.info(f"========== END {call_id} ==========")
+        except Exception as e:
+            self.logger.error(f"Error in extraction job for user {job.user_id}: {e}")
+            if not job.future.done():
+                job.future.set_exception(e)
+        finally:
+            self.extraction_queue.task_done()
 
     def offline_update(self, memory_list: List, construct_update_queue_trigger: bool = False, offline_update_trigger: bool = False):
         call_id = f"offline_update_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
