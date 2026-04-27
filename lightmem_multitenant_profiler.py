@@ -473,8 +473,29 @@ async def run_simulation(events, args, memory, rate_limiter):
     await asyncio.gather(*tasks)
     await asyncio.sleep(2); stop_mon.set(); await mon_task
     GLOBAL_METRICS.simulation_finished = True
+    
+    # Extract model name from memory manager
+    model_name = "unknown"
+    if hasattr(memory, 'manager') and hasattr(memory.manager, 'config'):
+        model_name = getattr(memory.manager.config, 'model', 'unknown')
+    model_short = str(model_name).split('/')[-1].replace('.', '-')
+
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    GLOBAL_METRICS.save(f"profiling_runs/{args.run_name}_{args.provider}_{run_id}")
+    
+    # Construct descriptive filename from key args
+    params = [
+        f"c{args.concurrency_limit}",
+        f"b{args.llm_batch_size}",
+        f"rpm{int(args.rpm)}",
+        f"dur{int(args.target_duration)}"
+    ]
+    if args.vllm_adaptive_shaping:
+        params.append("adaptive")
+        
+    param_str = "_".join(params)
+    filename = f"profiling_runs/{args.run_name}_{args.provider}_{model_short}_{param_str}_{run_id}"
+    
+    GLOBAL_METRICS.save(filename)
 
 def setup_lightmem(args):
     builder = _BUILDERS.get(args.provider)
