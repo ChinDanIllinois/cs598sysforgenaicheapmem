@@ -583,6 +583,7 @@ def main_cli():
     args = parse_args()
     os.makedirs("profiling_runs", exist_ok=True)
     events = load_events(args.data_path or os.getenv("DATA_PATH"), args)
+    print(f"Loaded {len(events)} events...")
     if not events: return
     if args.target_duration > 0:
         span = events[-1]["ts"] - events[0]["ts"]
