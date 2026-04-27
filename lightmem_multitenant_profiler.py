@@ -329,10 +329,13 @@ def create_dash_app(requests_pathname_prefix: str):
             fig_users.add_trace(make_scatter(ux, uy, ACCENT4, "Total Unique Tenants", fill="tozeroy"))
         fig_users.update_layout(title="Tenant Saturation (Unique Users)", **PLOT_LAYOUT)
 
-        # 5. Pipeline Stages
+        # 5. Pipeline Stages (using throughput_records for aggregate deltas)
         fig_sb = go.Figure()
-        if data:
-            df = pd.DataFrame(data)
+        if len(tput_hist) > 1:
+            # Calculate deltas between polls to show "Current" stage distribution
+            t_df = pd.DataFrame(tput_hist)
+            t_df_delta = t_df.set_index("elapsed_sec").diff().reset_index()
+            
             stages = [
                 ("stage_compress_time", "Compress", ACCENT), 
                 ("stage_segment_time", "Segment", ACCENT2), 
@@ -340,12 +343,14 @@ def create_dash_app(requests_pathname_prefix: str):
                 ("stage_db_insert_time", "DB Insert", ACCENT4)
             ]
             for k, label, color in stages:
-                if k in df.columns:
-                    # Show average per 5s window for better readability
-                    df["win"] = (df["wall_time"] // 5) * 5
-                    win_stages = df.groupby("win")[k].mean().reset_index()
-                    fig_sb.add_trace(go.Bar(name=label, x=win_stages["win"], y=win_stages[k], marker_color=color))
-        fig_sb.update_layout(barmode="stack", title="Pipeline Stage Timings (Avg Sec/Stage)", **PLOT_LAYOUT)
+                if k in t_df_delta.columns:
+                    fig_sb.add_trace(go.Bar(
+                        name=label, 
+                        x=t_df_delta["elapsed_sec"], 
+                        y=t_df_delta[k], 
+                        marker_color=color
+                    ))
+        fig_sb.update_layout(barmode="stack", title="Pipeline Stage Distribution (Seconds per Interval)", **PLOT_LAYOUT)
 
         # 6. Backlog Figure
         fig_backlog = go.Figure()
@@ -471,7 +476,8 @@ async def monitor_throughput(memory, metrics, stop_event):
                 "completed_so_far": cur, 
                 "errors_so_far": err,
                 "archives": metrics.active_archives, 
-                "queries": metrics.active_queries
+                "queries": metrics.active_queries,
+                "total_backlog": metrics.active_archives + metrics.active_queries
             }
             
             # Add accumulated stage timings for the dashboard
