@@ -553,7 +553,8 @@ def setup_mem0(args):
             "config": {
                 "model": os.getenv("VLLM_MODEL_NAME"),
                 "api_key": os.getenv("VLLM_API_KEY", "EMPTY"),
-                "openai_api_base": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+                "openai_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+                "max_tokens": 1500  # Restricts the output length
             }
         }
 

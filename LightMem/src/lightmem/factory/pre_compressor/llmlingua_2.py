@@ -106,6 +106,11 @@ class LlmLingua2Compressor:
     def __init__(self, config: Optional[LlmLingua2Config] = None):
         self.config = config
 
+        if getattr(self.config, 'use_server', False):
+            self.server_url = self.config.server_url
+            self._compressor = None
+            return
+
         try:
             import importlib
             importlib.import_module("llmlingua")
@@ -160,31 +165,49 @@ class LlmLingua2Compressor:
         if not all_contents:
             return batch_of_messages
 
-        # Run compression in one big batch
-        # Safety: Ensure total tokens doesn't cause a hang if the model is picky
-        compress_config = {
-            'context': all_contents,
-            **self.config.compress_config
-        }
-        
-        try:
-            # LLMLingua-2 PromptCompressor.compress_prompt handles lists in 'context'
-            with self._lock:
-                results = self._compressor.compress_prompt(**compress_config)
-            compressed_prompts = results['compressed_prompt']
+        if getattr(self.config, 'use_server', False):
+            try:
+                response = requests.post(
+                    self.server_url, 
+                    json={
+                        "contexts": all_contents,
+                        "rate": self.config.compress_config.get('rate', 0.8),
+                        "target_token": self.config.compress_config.get('target_token', -1)
+                    },
+                    timeout=30
+                )
+                response.raise_for_status()
+                compressed_prompts = response.json()["compressed_prompts"]
+            except Exception as e:
+                print(f"Server batch compression error: {e}")
+                return batch_of_messages
+        else:
+            # Run compression in one big batch
+            # Safety: Ensure total tokens doesn't cause a hang if the model is picky
+            compress_config = {
+                'context': all_contents,
+                **self.config.compress_config
+            }
             
-            # If it's a single string (only 1 message total), wrap it in a list
-            if isinstance(compressed_prompts, str):
-                compressed_prompts = [compressed_prompts]
+            try:
+                # LLMLingua-2 PromptCompressor.compress_prompt handles lists in 'context'
+                with self._lock:
+                    results = self._compressor.compress_prompt(**compress_config)
+                compressed_prompts = results['compressed_prompt']
+                
+                # If it's a single string (only 1 message total), wrap it in a list
+                if isinstance(compressed_prompts, str):
+                    compressed_prompts = [compressed_prompts]
+    
+            except Exception as e:
+                print(f"Batch compression error: {e}")
+                return batch_of_messages
+                # Fallback is to return original (partially updated or not)
 
-            # Map results back to original messages
-            for i, (b_idx, m_idx) in enumerate(mapping):
-                if i < len(compressed_prompts):
-                    batch_of_messages[b_idx][m_idx]['content'] = compressed_prompts[i].strip()
-
-        except Exception as e:
-            print(f"Batch compression error: {e}")
-            # Fallback is to return original (partially updated or not)
+        # Map results back to original messages
+        for i, (b_idx, m_idx) in enumerate(mapping):
+            if i < len(compressed_prompts):
+                batch_of_messages[b_idx][m_idx]['content'] = compressed_prompts[i].strip()
 
         return batch_of_messages
 
