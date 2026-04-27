@@ -169,10 +169,8 @@ class LlmLingua2Compressor:
         
         try:
             # LLMLingua-2 PromptCompressor.compress_prompt handles lists in 'context'
-            print("DEBUG: Entering LLMLingua-2 model call...")
             with self._lock:
                 results = self._compressor.compress_prompt(**compress_config)
-            print("DEBUG: Exited LLMLingua-2 model call successfully.")
             compressed_prompts = results['compressed_prompt']
             
             # If it's a single string (only 1 message total), wrap it in a list
