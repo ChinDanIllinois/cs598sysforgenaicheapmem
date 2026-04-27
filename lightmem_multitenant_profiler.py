@@ -424,9 +424,9 @@ async def monitor_throughput(memory, metrics, stop_event):
         now = time.time()
         
         # Periodically pull global stats from LightMem
-        print("DEBUG: Monitor fetching statistics from memory...")
+        print("DEBUG: Monitor fetching statistics from memory (in thread)...")
         try:
-            all_stats = memory.get_token_statistics()
+            all_stats = await asyncio.to_thread(memory.get_token_statistics)
             print("DEBUG: Monitor statistics successfully fetched.")
         except Exception as e:
             print(f"DEBUG: Monitor failed to fetch stats: {e}")
@@ -488,11 +488,16 @@ async def run_simulation(events, args, memory, rate_limiter):
                 else: GLOBAL_METRICS.active_queries += 1
             try:
                 if event["type"] == "archive":
+                    print(f"DEBUG: [{uid}] Starting add_memory (compression + segmentation)...")
                     res = await asyncio.to_thread(memory.add_memory, messages=event["content"], user_id=event["user_id"], force_segment=True, force_extract=True)
                     if isinstance(res, dict) and "extraction_future" in res:
+                        print(f"DEBUG: [{uid}] Waiting for background extraction...")
                         await asyncio.wrap_future(res["extraction_future"])
+                        print(f"DEBUG: [{uid}] Extraction finished.")
                 else:
+                    print(f"DEBUG: [{uid}] Starting retrieve_memory...")
                     await asyncio.to_thread(memory.retrieve_memory, query=event["content"], user_id=event["user_id"])
+                    print(f"DEBUG: [{uid}] Retrieval finished.")
                 
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success")
