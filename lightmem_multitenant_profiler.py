@@ -240,7 +240,8 @@ def create_dash_app(requests_pathname_prefix: str):
         ], ncols=2),
         section("Simulation Progress", [
             card_graph("sim_progress"),
-        ], ncols=1),
+            card_graph("recent_errors"),
+        ], ncols=2),
     ], style={"padding": "0 28px 40px"}),
 
     dcc.Interval(id="interval", interval=2000, n_intervals=0),
@@ -255,6 +256,7 @@ def create_dash_app(requests_pathname_prefix: str):
             Output("stage_breakdown", "figure"),
             Output("live_backlog", "figure"),
             Output("sim_progress", "figure"),
+            Output("recent_errors", "figure"),
             Output("status_badge", "children"),
             Output("sim-info", "children"),
         ],
@@ -331,11 +333,19 @@ def create_dash_app(requests_pathname_prefix: str):
         fig_sb = go.Figure()
         if data:
             df = pd.DataFrame(data)
-            stages = [("stage_compress", "Compress", ACCENT), ("stage_segment", "Segment", ACCENT2), ("stage_llm_extract", "LLM Extract", ACCENT3), ("stage_db_insert", "DB Insert", ACCENT4)]
+            stages = [
+                ("stage_compress_time", "Compress", ACCENT), 
+                ("stage_segment_time", "Segment", ACCENT2), 
+                ("stage_llm_extract_time", "LLM Extract", ACCENT3), 
+                ("stage_db_insert_time", "DB Insert", ACCENT4)
+            ]
             for k, label, color in stages:
                 if k in df.columns:
-                    fig_sb.add_trace(go.Bar(name=label, x=df.index[-50:], y=df[k].tail(50), marker_color=color))
-        fig_sb.update_layout(barmode="stack", title="Recent Pipeline Breakdown (last 50 events)", **PLOT_LAYOUT)
+                    # Show average per 5s window for better readability
+                    df["win"] = (df["wall_time"] // 5) * 5
+                    win_stages = df.groupby("win")[k].mean().reset_index()
+                    fig_sb.add_trace(go.Bar(name=label, x=win_stages["win"], y=win_stages[k], marker_color=color))
+        fig_sb.update_layout(barmode="stack", title="Pipeline Stage Timings (Avg Sec/Stage)", **PLOT_LAYOUT)
 
         # 6. Backlog Figure
         fig_backlog = go.Figure()
@@ -346,6 +356,20 @@ def create_dash_app(requests_pathname_prefix: str):
             fig_backlog.add_trace(make_scatter(bx, by_arch, ACCENT, "Queued Writes (Archives)", fill="tozeroy"))
             fig_backlog.add_trace(make_scatter(bx, by_q, ACCENT2, "Queued Reads (Queries)", fill="tonexty"))
         fig_backlog.update_layout(title="Active Backlog (In-Flight Requests)", **PLOT_LAYOUT)
+
+        # 8. Recent Errors
+        fig_err = go.Figure()
+        if data:
+            df = pd.DataFrame(data)
+            err_df = df[df["status"] == "error"]
+            if not err_df.empty:
+                err_tail = err_df.tail(50)
+                fig_err.add_trace(go.Scatter(
+                    x=err_tail.index, y=err_tail["user_id"],
+                    mode="markers", marker=dict(color=ACCENT_ERR, size=12, symbol="x"),
+                    name="Error"
+                ))
+        fig_err.update_layout(title="Last 50 Errors (Event Timeline)", **PLOT_LAYOUT, xaxis_title="Event Index", yaxis_title="User ID")
 
         # 7. Simulation Progress
         fig_prog = go.Figure()
@@ -376,7 +400,7 @@ def create_dash_app(requests_pathname_prefix: str):
         status = html.Span("✅ Finished", style={"color": "#6ee7b7"}) if finished else html.Span("⚡ Processing", style={"color": ACCENT2})
         info = f"Progress: {total_comp}/{total_evs} | Multi-Tenant Simulation v1.0"
 
-        return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_backlog, fig_prog, status, info
+        return fig_tput, fig_lat, fig_mix, fig_users, fig_sb, fig_backlog, fig_prog, fig_err, status, info
     
     return app
 
@@ -451,10 +475,17 @@ async def monitor_throughput(memory, metrics, stop_event):
             }
             
             # Add accumulated stage timings for the dashboard
-            stage_stats = all_stats.get("llm", {}).get("add_memory", {})
-            for k in ["stage_compress_time", "stage_segment_time", "stage_llm_extract_time", "stage_db_insert_time"]:
-                if k in stage_stats:
-                    record[k] = stage_stats[k]
+            # Extract pipeline stage timings
+            stage_stats = all_stats.get("stage_timings", {})
+            mapping = {
+                "stage_compress_time": "compress",
+                "stage_segment_time": "segment",
+                "stage_llm_extract_time": "llm_extract",
+                "stage_db_insert_time": "db_insert"
+            }
+            for prof_k, lib_k in mapping.items():
+                if lib_k in stage_stats:
+                    record[prof_k] = stage_stats[lib_k]
                     
             metrics.throughput_records.append(record)
             metrics.queue_depth_history.append(record) # Re-use same record for history
