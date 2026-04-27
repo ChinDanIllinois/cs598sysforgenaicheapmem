@@ -36,6 +36,8 @@ flask.cli.show_server_banner = lambda *args: None
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 logging.getLogger('flask').setLevel(logging.ERROR)
 logging.getLogger('dash').setLevel(logging.ERROR)
+logging.getLogger('lightmem').setLevel(logging.ERROR)
+logging.getLogger('LightMemory').setLevel(logging.ERROR)
 
 dotenv.load_dotenv()
 
@@ -202,7 +204,11 @@ def section(title, graphs, ncols=2):
 
 
 def create_dash_app(requests_pathname_prefix: str):
-    app = Dash(__name__,requests_pathname_prefix=requests_pathname_prefix)
+    app = Dash(
+        __name__,
+        requests_pathname_prefix=requests_pathname_prefix,
+        routes_pathname_prefix="/"
+    )
     app.title = "LightMem Multi-Tenant Dashboard"
 
     app.layout = html.Div([
@@ -255,6 +261,8 @@ def create_dash_app(requests_pathname_prefix: str):
         [Input("interval", "n_intervals")]
     )
     def update_metrics(n):
+        # Debug: check if callback is triggering
+        # print(f"Dashboard polling... interval={n}")
         with GLOBAL_METRICS.lock:
             data = list(GLOBAL_METRICS.results)
             tput_hist = list(GLOBAL_METRICS.throughput_records)
@@ -567,7 +575,7 @@ def setup_lightmem(args):
         "index_strategy": "embedding", 
         "text_embedder": embedder_cfg,
         "retrieve_strategy": "embedding", "embedding_retriever": {"model_name": "qdrant", "configs": {"collection_name": f"mt_{uuid.uuid4().hex[:4]}", "embedding_model_dims": 384, "path": f"{os.getenv('QDRANT_DATA_DIR')}/multitenant"}},
-        "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "INFO"},
+        "update": "offline" if args.provider == "vllm" else "sync", "logging": {"level": "ERROR"},
         "extraction_concurrency": args.concurrency_limit
     })
 
