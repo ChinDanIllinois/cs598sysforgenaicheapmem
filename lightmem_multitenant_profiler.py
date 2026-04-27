@@ -501,7 +501,7 @@ async def monitor_throughput(memory, metrics, stop_event):
             print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Backlog: {metrics.active_archives + metrics.active_queries:3} | Total: {cur:5}")
 
 async def run_simulation(events, args, memory, rate_limiter):
-    print(f"DEBUG: Simulation started. Total events: {len(events)}")
+    # print(f"DEBUG: Simulation started. Total events: {len(events)}")
     sem = asyncio.Semaphore(args.concurrency_limit)
     first_ts, start_wall = events[0]["ts"], time.time()
     GLOBAL_METRICS.total_events = len(events)
@@ -525,16 +525,16 @@ async def run_simulation(events, args, memory, rate_limiter):
                 else: GLOBAL_METRICS.active_queries += 1
             try:
                 if event["type"] == "archive":
-                    print(f"DEBUG: [{uid}] Starting add_memory (compression + segmentation)...")
+                    # print(f"DEBUG: [{uid}] Starting add_memory (compression + segmentation)...")
                     res = await asyncio.to_thread(memory.add_memory, messages=event["content"], user_id=event["user_id"], force_segment=True, force_extract=True)
                     if isinstance(res, dict) and "extraction_future" in res:
-                        print(f"DEBUG: [{uid}] Waiting for background extraction...")
+                        # print(f"DEBUG: [{uid}] Waiting for background extraction...")
                         await asyncio.wrap_future(res["extraction_future"])
-                        print(f"DEBUG: [{uid}] Extraction finished.")
+                        # print(f"DEBUG: [{uid}] Extraction finished.")
                 else:
-                    print(f"DEBUG: [{uid}] Starting retrieve_memory...")
+                    # print(f"DEBUG: [{uid}] Starting retrieve_memory...")
                     await asyncio.to_thread(memory.retrieve_memory, query=event["content"], user_id=event["user_id"])
-                    print(f"DEBUG: [{uid}] Retrieval finished.")
+                    # print(f"DEBUG: [{uid}] Retrieval finished.")
                 
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success")
@@ -549,16 +549,14 @@ async def run_simulation(events, args, memory, rate_limiter):
                     if is_archive: GLOBAL_METRICS.active_archives -= 1
                     else: GLOBAL_METRICS.active_queries -= 1
 
-    print(f"DEBUG: Starting event dispatch loop. time_scale={args.time_scale}")
+    # print(f"DEBUG: Starting event dispatch loop. time_scale={args.time_scale}")
     for i, ev in enumerate(events):
         delay = start_wall + ((ev["ts"] - first_ts) / args.time_scale) - time.time()
-        if delay > 5:
-            print(f"DEBUG: Event {i} delayed by {delay:.1f}s")
         if delay > 0: await asyncio.sleep(delay)
         tasks.append(asyncio.create_task(run_event(ev)))
-        if (i+1) % 50 == 0: print(f"Dispatched {i+1}/{len(events)} events...")
+        # if (i+1) % 50 == 0: print(f"Dispatched {i+1}/{len(events)} events...")
     
-    print("DEBUG: All events dispatched. Waiting for completion...")
+    # print("DEBUG: All events dispatched. Waiting for completion...")
     await asyncio.gather(*tasks)
     await asyncio.sleep(2); stop_mon.set(); await mon_task
     GLOBAL_METRICS.simulation_finished = True

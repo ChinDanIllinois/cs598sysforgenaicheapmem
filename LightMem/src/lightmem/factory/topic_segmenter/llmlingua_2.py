@@ -57,15 +57,15 @@ class LlmLingua2Segmenter:
         input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
         # Hard truncate to model's capacity to prevent hangs
         if input_tensor.shape[1] > self.buffer_len:
-            print(f"DEBUG: Truncating segmenter input from {input_tensor.shape[1]} to {self.buffer_len}")
+            # print(f"DEBUG: Truncating segmenter input from {input_tensor.shape[1]} to {self.buffer_len}")
             input_tensor = input_tensor[:, :self.buffer_len]
             
         attention_mask = torch.ones_like(input_tensor, device=device)
 
         with torch.no_grad():
-            print("DEBUG: Segmenter entering LLMLingua-2 model call...")
+            # print("DEBUG: Segmenter entering LLMLingua-2 model call...")
             outputs = self._call_model(input_tensor, attention_mask=attention_mask, output_attentions=True, return_dict=True)
-            print("DEBUG: Segmenter exited LLMLingua-2 model call.")
+            # print("DEBUG: Segmenter exited LLMLingua-2 model call.")
             attentions = outputs.attentions
 
         selected = [attentions[i] for i in self.layers]
