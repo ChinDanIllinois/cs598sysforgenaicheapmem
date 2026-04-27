@@ -261,8 +261,11 @@ def create_dash_app(requests_pathname_prefix: str):
         [Input("interval", "n_intervals")]
     )
     def update_metrics(n):
-        # Debug: check if callback is triggering
-        # print(f"Dashboard polling... interval={n}")
+        with GLOBAL_METRICS.lock:
+            d_count = len(GLOBAL_METRICS.results)
+            t_count = len(GLOBAL_METRICS.throughput_records)
+        print(f"Dashboard Polling #{n}: events={d_count}, tput_records={t_count}, id={id(GLOBAL_METRICS)}")
+
         with GLOBAL_METRICS.lock:
             data = list(GLOBAL_METRICS.results)
             tput_hist = list(GLOBAL_METRICS.throughput_records)
@@ -450,6 +453,7 @@ async def monitor_throughput(memory, metrics, stop_event):
             metrics.queue_depth_history.append(record) # Re-use same record for history
             
             last_count, last_time = cur, now
+            print(f"Simulation Update: events={cur}, tput_records={len(metrics.throughput_records)}, id={id(metrics)}")
             print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Backlog: {metrics.active_archives + metrics.active_queries:3} | Total: {cur:5}")
 
 async def run_simulation(events, args, memory, rate_limiter):
