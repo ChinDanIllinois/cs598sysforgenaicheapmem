@@ -150,6 +150,10 @@ class LlmLingua2Compressor:
             for m_idx, mes in enumerate(messages):
                 content = mes.get('content', '').strip()
                 if content:
+                    # Truncate to avoid model hangs on long inputs
+                    # LLMLingua-2 usually has a 512 context limit
+                    if len(content) > 2000: # Heuristic for ~500 tokens
+                        content = content[:2000]
                     all_contents.append(content)
                     mapping.append((b_idx, m_idx))
 
@@ -157,6 +161,7 @@ class LlmLingua2Compressor:
             return batch_of_messages
 
         # Run compression in one big batch
+        # Safety: Ensure total tokens doesn't cause a hang if the model is picky
         compress_config = {
             'context': all_contents,
             **self.config.compress_config
