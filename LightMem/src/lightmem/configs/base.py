@@ -120,4 +120,8 @@ class BaseMemoryConfigs(BaseModel):
                     "- 'flat': Extract factual entries only (independent units)\n"
                     "- 'event': Extract event-level structure (factual + relational, temporally bound)"
     )
+    extraction_concurrency: Optional[int] = Field(
+        default=32,
+        description="Maximum number of parallel extraction threads in the background worker."
+    )
 
