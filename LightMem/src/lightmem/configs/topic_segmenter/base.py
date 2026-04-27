@@ -10,6 +10,16 @@ class TopicSegmenterConfig(BaseModel):
 
     configs: Optional[dict] = Field(description="Configuration for the specific TopicSegmenter model", default={})
 
+    use_server: bool = Field(
+        default=False,
+        description="Whether to use an external serving engine for segmentation."
+    )
+
+    server_url: str = Field(
+        default="http://localhost:8090/segment",
+        description="The URL of the external serving engine for segmentation."
+    )
+
     @model_validator(mode='before')
     def validate_model_name(cls, values):
         default_model = cls.__pydantic_fields__["model_name"].default

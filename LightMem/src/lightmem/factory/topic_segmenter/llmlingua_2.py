@@ -1,9 +1,10 @@
 from typing import Dict, Optional, List, Any
 import torch, numpy as np
+import requests
 from transformers import AutoTokenizer, AutoModel
 
 class LlmLingua2Segmenter:
-    def __init__(self, config: Optional[Dict] = None, shared: bool = False, compressor=None):
+    def __init__(self, config: Any = None, shared: bool = False, compressor=None):
         self.config = config
 
         if shared is False or compressor is None:
@@ -21,7 +22,8 @@ class LlmLingua2Segmenter:
             self.buffer_len = getattr(self.model.config, "max_position_embeddings", 512)
             self._lock = getattr(compressor, "_lock", None)
 
-        self.layers = self.config.get("layers", [8, 9, 10, 11])
+        cfg_dict = getattr(self.config, "configs", {}) or {}
+        self.layers = cfg_dict.get("layers", [8, 9, 10, 11])
 
     def _call_model(self, *args, **kwargs):
         if self._lock:
@@ -120,10 +122,26 @@ class LlmLingua2Segmenter:
 
         return M
 
-    def propose_cut(self, buffer_texts: List[str]) -> Dict[str, Any]:
+    def propose_cut(self, buffer_texts: List[str]) -> List[int]:
         n = len(buffer_texts)
         if n == 0:
             return []
+
+        if getattr(self.config, 'use_server', False):
+            try:
+                response = requests.post(
+                    self.server_url,
+                    json={
+                        "buffer_texts": buffer_texts,
+                        "layers": self.layers
+                    },
+                    timeout=30
+                )
+                response.raise_for_status()
+                return response.json()["boundaries"]
+            except Exception as e:
+                print(f"Server segmentation error: {e}")
+                return []
 
         M = self.sentence_level_attention(buffer_texts)
         outer = [M[i, i-1] for i in range(1, n)]
