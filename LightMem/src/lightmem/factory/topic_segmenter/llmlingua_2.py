@@ -23,6 +23,8 @@ class LlmLingua2Segmenter:
         else:
             self._lock = None
 
+        self.layers = self.config.get("layers", [8, 9, 10, 11])
+
     def _call_model(self, *args, **kwargs):
         if self._lock:
             with self._lock:
