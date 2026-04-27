@@ -416,15 +416,22 @@ def load_events(data_path: str, args):
     return all_events[:args.max_events] if args.max_events > 0 else all_events
 
 async def monitor_throughput(memory, metrics, stop_event):
+    print("DEBUG: Monitor task started.")
     last_count = 0
     last_time = time.time()
     while not stop_event.is_set():
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         now = time.time()
         
         # Periodically pull global stats from LightMem
-        # This replaces the expensive per-event stats calls
-        all_stats = memory.get_token_statistics()
+        print("DEBUG: Monitor fetching statistics from memory...")
+        try:
+            all_stats = memory.get_token_statistics()
+            print("DEBUG: Monitor statistics successfully fetched.")
+        except Exception as e:
+            print(f"DEBUG: Monitor failed to fetch stats: {e}")
+            continue
+
         summary = all_stats.get("summary", {})
         llm = all_stats.get("llm", {})
         
@@ -457,6 +464,7 @@ async def monitor_throughput(memory, metrics, stop_event):
             print(f"   >>> [{now - metrics.start_time:6.1f}s] T-Put: {tput:6.2f} eps | Backlog: {metrics.active_archives + metrics.active_queries:3} | Total: {cur:5}")
 
 async def run_simulation(events, args, memory, rate_limiter):
+    print(f"DEBUG: Simulation started. Total events: {len(events)}")
     sem = asyncio.Semaphore(args.concurrency_limit)
     first_ts, start_wall = events[0]["ts"], time.time()
     GLOBAL_METRICS.total_events = len(events)
@@ -464,7 +472,7 @@ async def run_simulation(events, args, memory, rate_limiter):
     mon_task = asyncio.create_task(monitor_throughput(memory, GLOBAL_METRICS, stop_mon))
     tasks = []
     user_locks = {}
-
+    
     async def run_event(event):
         uid = event["user_id"]
         if uid not in user_locks:
@@ -499,11 +507,16 @@ async def run_simulation(events, args, memory, rate_limiter):
                     if is_archive: GLOBAL_METRICS.active_archives -= 1
                     else: GLOBAL_METRICS.active_queries -= 1
 
+    print(f"DEBUG: Starting event dispatch loop. time_scale={args.time_scale}")
     for i, ev in enumerate(events):
         delay = start_wall + ((ev["ts"] - first_ts) / args.time_scale) - time.time()
+        if delay > 5:
+            print(f"DEBUG: Event {i} delayed by {delay:.1f}s")
         if delay > 0: await asyncio.sleep(delay)
         tasks.append(asyncio.create_task(run_event(ev)))
         if (i+1) % 50 == 0: print(f"Dispatched {i+1}/{len(events)} events...")
+    
+    print("DEBUG: All events dispatched. Waiting for completion...")
     await asyncio.gather(*tasks)
     await asyncio.sleep(2); stop_mon.set(); await mon_task
     GLOBAL_METRICS.simulation_finished = True
