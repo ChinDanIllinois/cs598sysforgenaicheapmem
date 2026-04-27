@@ -10,16 +10,7 @@ class LlmLingua2Segmenter:
         if getattr(self.config, 'use_server', False):
             self.server_url = self.config.server_url
             self.model = None
-            
-            # Still need a tokenizer locally for token counting in LightMem buffers
-            cfg_dict = getattr(self.config, "configs", {}) or {}
-            model_name = cfg_dict.get("model_name")
-            if not model_name and compressor and hasattr(compressor, "config") and hasattr(compressor.config, "llmlingua_config"):
-                model_name = compressor.config.llmlingua_config.get("model_name")
-            if not model_name:
-                model_name = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = None # Use lightweight word-count fallback to save RAM
             self.buffer_len = 512
             self._lock = None
         elif shared is False or compressor is None or getattr(compressor, "inner_compressor", None) is None:
