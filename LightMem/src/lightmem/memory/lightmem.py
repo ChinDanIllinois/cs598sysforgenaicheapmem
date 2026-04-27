@@ -358,28 +358,28 @@ class LightMemory:
             }
 
         _t0 = _time.perf_counter()
-        all_segments = tenant.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
-
-        if force_segment:
-            all_segments = tenant.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
-        _t_segment = _time.perf_counter() - _t0
-        
         with tenant.lock:
+            all_segments = tenant.senmem_buffer_manager.add_messages(compressed_messages, self.segmenter, self.text_embedder)
+
+            if force_segment:
+                all_segments = tenant.senmem_buffer_manager.cut_with_segmenter(self.segmenter, self.text_embedder, force_segment)
+            _t_segment = _time.perf_counter() - _t0
+            
             tenant.token_stats["stage_compress_time"] += _t_compress
             tenant.token_stats["stage_segment_time"] += _t_segment
         
-        if not all_segments:
-            self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
-            return result # TODO
+            if not all_segments:
+                self.logger.debug(f"[{call_id}] No segments generated, returning empty result")
+                return result # TODO
 
             self.logger.info(f"[{call_id}] Generated {len(all_segments)} segments")
             self.logger.debug(f"[{call_id}] Segments sample: {json.dumps(all_segments)}")
 
-        extract_trigger_num, extract_list = tenant.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
+            extract_trigger_num, extract_list = tenant.shortmem_buffer_manager.add_segments(all_segments, self.config.messages_use, force_extract)
 
-        if extract_trigger_num == 0:
-            self.logger.debug(f"[{call_id}] Extraction not triggered, returning result")
-            return result # TODO 
+            if extract_trigger_num == 0:
+                self.logger.debug(f"[{call_id}] Extraction not triggered, returning result")
+                return result # TODO 
         
         topic_id_mapping = []
         with tenant.lock:
