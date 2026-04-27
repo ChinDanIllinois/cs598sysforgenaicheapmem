@@ -19,6 +19,15 @@ class LlmLingua2Segmenter:
             self.model = compressor.inner_compressor.model
             self.tokenizer = compressor.inner_compressor.tokenizer
             self.buffer_len = getattr(self.model.config, "max_position_embeddings", 512)
+            self._lock = getattr(compressor, "_lock", None)
+        else:
+            self._lock = None
+
+    def _call_model(self, *args, **kwargs):
+        if self._lock:
+            with self._lock:
+                return self.model(*args, **kwargs)
+        return self.model(*args, **kwargs)
 
         self.layers = self.config.get("layers", [8, 9, 10, 11])
 
@@ -47,7 +56,7 @@ class LlmLingua2Segmenter:
         attention_mask = torch.ones_like(input_tensor, device=device)
 
         with torch.no_grad():
-            outputs = model(input_tensor, attention_mask=attention_mask, output_attentions=True, return_dict=True)
+            outputs = self._call_model(input_tensor, attention_mask=attention_mask, output_attentions=True, return_dict=True)
             attentions = outputs.attentions
 
         selected = [attentions[i] for i in self.layers]

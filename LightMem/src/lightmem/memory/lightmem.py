@@ -330,7 +330,11 @@ class LightMemory:
             # Use the compressor batcher to coalesce requests across tenants
             _t0 = _time.perf_counter()
             fut = self.compressor_batcher.add_request(msgs)
-            compressed_messages = fut.result() # Wait for the batch to finish
+            try:
+                compressed_messages = fut.result(timeout=30) # Wait for the batch to finish
+            except concurrent.futures.TimeoutError:
+                self.logger.error(f"[{call_id}] Compression timed out after 30s. Using uncompressed messages.")
+                compressed_messages = msgs
             _t_compress = _time.perf_counter() - _t0
             
             cfg = getattr(self.compressor, "config", None)
