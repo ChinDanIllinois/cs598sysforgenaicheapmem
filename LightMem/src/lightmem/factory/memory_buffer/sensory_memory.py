@@ -10,7 +10,10 @@ class SenMemBufferManager:
         self.token_count: int = 0
 
     def _recount_tokens(self) -> None:
-        self.token_count = sum(len(self.tokenizer.encode(m["content"])) for m in self.buffer if m["role"]=="user")
+        if self.tokenizer:
+            self.token_count = sum(len(self.tokenizer.encode(m["content"])) for m in self.buffer if m["role"]=="user")
+        else:
+            self.token_count = sum(len(m["content"].split()) for m in self.buffer if m["role"]=="user")
 
     def add_messages(self, messages: List[Dict], segmenter, text_embedder) -> List[List[Dict]]:
         all_segments = []
