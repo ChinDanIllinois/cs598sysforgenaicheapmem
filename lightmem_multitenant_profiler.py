@@ -630,7 +630,13 @@ def setup_lightmem(args):
                 "compress_config": {"rate": 0.6}
             }
         },
-        "topic_segment": True, "precomp_topic_shared": True, "topic_segmenter": {"model_name": "llmlingua-2"},
+        "topic_segment": True, 
+        "precomp_topic_shared": True, 
+        "topic_segmenter": {
+            "model_name": "llmlingua-2",
+            "use_server": args.use_server_compress,
+            "server_url": "http://localhost:8090/segment"
+        },
         "messages_use": "user_only", "metadata_generate": True, "text_summary": True, "memory_manager": cfg, "extract_threshold": 0.1,
         "index_strategy": "embedding", 
         "text_embedder": embedder_cfg,
