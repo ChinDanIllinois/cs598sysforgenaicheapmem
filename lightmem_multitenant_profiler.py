@@ -135,6 +135,7 @@ def parse_args():
     parser.add_argument("--vllm-metrics-url", type=str, default="")
     parser.add_argument("--vllm-embed-url", type=str, default="", help="vLLM endpoint for embedding model.")
     parser.add_argument("--rpm", type=float, default=0.0, metavar="RPM")
+    parser.add_argument("--use-server-compress", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=True, help="Use external server for llmlingua-2 compression (default: True)")
     
     # Multi-Tenant Simulation Control
     parser.add_argument("--data-path", type=str, default="")
@@ -624,6 +625,8 @@ def setup_lightmem(args):
                     "device_map": device, 
                     "use_llmlingua2": True
                 }, 
+                "use_server": args.use_server_compress,
+                "server_url": "http://localhost:8080/compress",
                 "compress_config": {"rate": 0.6}
             }
         },
