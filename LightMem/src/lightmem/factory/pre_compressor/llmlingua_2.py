@@ -133,6 +133,54 @@ class LlmLingua2Compressor:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize LlmLingua2Compressor: {str(e)}")
 
+    def compress_batch(
+        self,
+        batch_of_messages: List[List[Dict[str, str]]],
+        tokenizer: Union[PreTrainedTokenizerBase, Any, None] = None,
+    ) -> List[List[Dict[str, str]]]:
+        """
+        Compress a batch of message lists (cross-tenant batching).
+        """
+        # Flatten all messages to compress them in one GPU call if possible
+        all_contents = []
+        mapping = [] # (batch_idx, msg_idx)
+        
+        for b_idx, messages in enumerate(batch_of_messages):
+            for m_idx, mes in enumerate(messages):
+                content = mes.get('content', '').strip()
+                if content:
+                    all_contents.append(content)
+                    mapping.append((b_idx, m_idx))
+
+        if not all_contents:
+            return batch_of_messages
+
+        # Run compression in one big batch
+        compress_config = {
+            'context': all_contents,
+            **self.config.compress_config
+        }
+        
+        try:
+            # LLMLingua-2 PromptCompressor.compress_prompt handles lists in 'context'
+            results = self._compressor.compress_prompt(**compress_config)
+            compressed_prompts = results['compressed_prompt']
+            
+            # If it's a single string (only 1 message total), wrap it in a list
+            if isinstance(compressed_prompts, str):
+                compressed_prompts = [compressed_prompts]
+
+            # Map results back to original messages
+            for i, (b_idx, m_idx) in enumerate(mapping):
+                if i < len(compressed_prompts):
+                    batch_of_messages[b_idx][m_idx]['content'] = compressed_prompts[i].strip()
+
+        except Exception as e:
+            print(f"Batch compression error: {e}")
+            # Fallback is to return original (partially updated or not)
+
+        return batch_of_messages
+
     def compress(
         self,
         messages: List[Dict[str, str]],
