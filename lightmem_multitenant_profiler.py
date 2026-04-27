@@ -626,7 +626,7 @@ def setup_lightmem(args):
                     "use_llmlingua2": True
                 }, 
                 "use_server": args.use_server_compress,
-                "server_url": "http://localhost:8080/compress",
+                "server_url": "http://localhost:8090/compress",
                 "compress_config": {"rate": 0.6}
             }
         },

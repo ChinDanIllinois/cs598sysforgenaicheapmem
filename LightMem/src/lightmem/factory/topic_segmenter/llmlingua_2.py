@@ -20,8 +20,6 @@ class LlmLingua2Segmenter:
             self.tokenizer = compressor.inner_compressor.tokenizer
             self.buffer_len = getattr(self.model.config, "max_position_embeddings", 512)
             self._lock = getattr(compressor, "_lock", None)
-        else:
-            self._lock = None
 
         self.layers = self.config.get("layers", [8, 9, 10, 11])
 
