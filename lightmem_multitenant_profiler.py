@@ -199,7 +199,10 @@ def section(title, graphs, ncols=2):
 # DASHBOARD SETUP
 # ============================================================
 
-app = Dash(__name__, requests_pathname_prefix=os.getenv("DASH_PROXY_PREFIX", "/"))
+
+
+
+app = Dash(__name__)
 app.title = "LightMem Multi-Tenant Dashboard"
 
 app.layout = html.Div([
@@ -589,6 +592,13 @@ def main_cli():
 
     threading.Thread(target=lambda: asyncio.run(run_simulation(events, args, memory, limiter)), daemon=True).start()
     print(f"Dashboard serving at http://localhost:{args.port}")
+
+
+    prefix_str = os.getenv("DASH_PROXY_PREFIX", "/").strip("/")
+    requests_pathname_prefix = "/" + "/".join([prefix_str, str(args.port)]) if prefix_str else f"/{args.port}"
+    requests_pathname_prefix =requests_pathname_prefix+ "/"
+    
+    app.config.requests_pathname_prefix = requests_pathname_prefix
     app.run(host="0.0.0.0", port=args.port, debug=False)
 
 if __name__ == "__main__":
