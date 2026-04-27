@@ -24,6 +24,7 @@ from lightmem.configs.logging.utils import get_logger
 import queue
 from lightmem.memory.tenant import TenantState
 from lightmem.memory.queue_types import ExtractionJob
+from lightmem.factory.memory_manager.batch_processor import LocalBatchProcessor
 
 class MessageNormalizer:
 
@@ -180,6 +181,13 @@ class LightMemory:
         if self.config.pre_compress:
             self.logger.info("Initializing pre-compressor")
             self.compressor = PreCompressorFactory.from_config(self.config.pre_compressor)
+            # Initialize a batcher for the compressor to handle high concurrency
+            self.compressor_batcher = LocalBatchProcessor(
+                process_func=lambda b: self.compressor.compress_batch(b, getattr(self.compressor, "tokenizer", None)),
+                batch_size=16, # Coalesce up to 16 tenants
+                timeout=0.05,  # Wait at most 50ms
+                logger=self.logger
+            )
         if self.config.topic_segment:
             self.logger.info("Initializing topic segmenter")
             self.segmenter = TopicSegmenterFactory.from_config(self.config.topic_segmenter, self.config.precomp_topic_shared, getattr(self, "compressor", None))
@@ -319,9 +327,12 @@ class LightMemory:
             else:
                 args = (msgs,)
             # fixed: empty 'content' in the 'messages' of 'compress(*args)'
+            # Use the compressor batcher to coalesce requests across tenants
             _t0 = _time.perf_counter()
-            compressed_messages = self.compressor.compress(*args)
+            fut = self.compressor_batcher.add_request(msgs)
+            compressed_messages = fut.result() # Wait for the batch to finish
             _t_compress = _time.perf_counter() - _t0
+            
             cfg = getattr(self.compressor, "config", None)
             target_rate = None
             if cfg is not None:
