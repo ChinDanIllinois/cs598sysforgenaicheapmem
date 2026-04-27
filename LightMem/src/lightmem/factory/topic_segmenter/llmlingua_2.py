@@ -107,7 +107,7 @@ class LlmLingua2Segmenter:
     def propose_cut(self, buffer_texts: List[str]) -> Dict[str, Any]:
         n = len(buffer_texts)
         if n == 0:
-            return {"boundaries": [0], "cut_index": 0}
+            return []
 
         M = self.sentence_level_attention(buffer_texts)
         outer = [M[i, i-1] for i in range(1, n)]

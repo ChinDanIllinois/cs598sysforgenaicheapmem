@@ -48,6 +48,13 @@ class SenMemBufferManager:
         """
         segments = []
         buffer_texts = [m["content"] for m in self.buffer if m["role"] == "user"]
+        if not buffer_texts:
+            if self.buffer:
+                segments.append(self.buffer.copy())
+                self.buffer.clear()
+                self.token_count = 0
+            return segments
+
         boundaries = segmenter.propose_cut(buffer_texts)
 
         if not boundaries:
