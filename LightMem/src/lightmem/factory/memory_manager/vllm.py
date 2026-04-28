@@ -29,7 +29,7 @@ class VllmManager:
             or "http://localhost:8000/v1"
         )
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=30)
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=120)
 
     def _parse_response(self, response, tools):
         """
@@ -329,6 +329,8 @@ class VllmManager:
             for idx, fut in enumerate(futures):
                 try:
                     raw_response, usage_info = fut.result()
+                    if raw_response is None:
+                        raise ValueError("API returned None response due to timeout or error.")
                     metadata_facts = clean_response(raw_response)
                     for entry in metadata_facts:
                         entry["entry_type"] = entry_type
@@ -365,6 +367,8 @@ class VllmManager:
                     messages=metadata_messages,
                     response_format={"type": "json_object"},
                 )
+                if raw_response is None:
+                    raise ValueError("API returned None response due to timeout or error.")
                 metadata_facts = clean_response(raw_response)
                 
                 for entry in metadata_facts:
