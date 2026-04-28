@@ -701,7 +701,7 @@ class LightMemory:
                     empty_queue_count += 1
                 self.logger.debug(f"[{call_id}] Entry {eid} has no candidates after filtering")
 
-            with write_lock:
+            with self._db_write_lock:
                 self.embedding_retriever.update(vector_id=eid, vector=vec, payload=new_payload)
 
             with lock:
@@ -787,7 +787,7 @@ class LightMemory:
 
             action = updated_entry.get("action")
             if action == "delete":
-                with write_lock:
+                with self._db_write_lock:
                     self.embedding_retriever.delete(eid)
                 with lock:
                     deleted_count += 1
@@ -796,7 +796,7 @@ class LightMemory:
                 new_payload = dict(payload)
                 new_payload["memory"] = updated_entry.get("new_memory")
                 vector = entry.get("vector")
-                with write_lock:
+                with self._db_write_lock:
                     self.embedding_retriever.update(vector_id=eid, vector=vector, payload=new_payload)
                 with lock:
                     updated_count += 1
