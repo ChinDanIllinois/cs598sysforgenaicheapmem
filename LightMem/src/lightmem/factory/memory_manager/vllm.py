@@ -335,7 +335,8 @@ class VllmManager:
                         raise ValueError("API returned None response due to timeout or error.")
                     metadata_facts = clean_response(raw_response)
                     for entry in metadata_facts:
-                        entry["entry_type"] = entry_type
+                        if isinstance(entry, dict):
+                            entry["entry_type"] = entry_type
                         
                     results.append({
                         "input_prompt": get_metadata_messages(idx, extract_list[idx]),
@@ -374,7 +375,8 @@ class VllmManager:
                 metadata_facts = clean_response(raw_response)
                 
                 for entry in metadata_facts:
-                    entry["entry_type"] = entry_type
+                    if isinstance(entry, dict):
+                        entry["entry_type"] = entry_type
 
                 return {
                     "input_prompt": metadata_messages,
