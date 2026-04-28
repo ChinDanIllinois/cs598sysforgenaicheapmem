@@ -51,6 +51,9 @@ def compress_text(req: CompressRequest):
             compressed_prompts = [compressed_prompts]
             
         return {"compressed_prompts": compressed_prompts}
+    except ZeroDivisionError:
+        print(f"ERROR in /compress: ZeroDivisionError (empty or too short context)")
+        return {"compressed_prompts": req.contexts}
     except Exception as e:
         print(f"ERROR in /compress: {e}")
         traceback.print_exc()
