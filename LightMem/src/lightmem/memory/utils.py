@@ -244,7 +244,15 @@ def convert_extraction_results_to_memory_entries(
                 fact_list = [fact_list]
 
             for fact_entry in fact_list:
-                original_sid = int(fact_entry.get("source_id", 0))
+                if not isinstance(fact_entry, dict):
+                    continue
+                
+                # We know fact_entry is a dict now, but we should handle if source_id is missing or invalid type
+                try:
+                    original_sid = int(fact_entry.get("source_id", 0))
+                except (ValueError, TypeError):
+                    original_sid = 0
+                    
                 sid = original_sid
                 
                 if max_valid_sid is not None and sid > max_valid_sid:
