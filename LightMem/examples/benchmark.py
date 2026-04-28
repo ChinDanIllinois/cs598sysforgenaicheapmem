@@ -88,7 +88,7 @@ def build_config(collection_name: str, streaming_mode: bool) -> Dict[str, Any]:
     - topic segmentation disabled to avoid unrelated segmenter issues
     """
     return {
-        "pre_compress": not streaming_mode,
+        "pre_compress": True,
         "pre_compress_streaming": streaming_mode,
         "pre_compressor": {
             "model_name": "llmlingua-2",
@@ -97,6 +97,9 @@ def build_config(collection_name: str, streaming_mode: bool) -> Dict[str, Any]:
                     "model_name": LLMLINGUA_MODEL_PATH,
                     "device_map": "cpu",
                     "use_llmlingua2": True,
+            },
+            "compress_config": {
+                "rate": 0.6,
                 },
                 "compress_config": {
                     "rate": 0.6,
