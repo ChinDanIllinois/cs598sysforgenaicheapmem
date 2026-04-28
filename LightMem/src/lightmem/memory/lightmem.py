@@ -219,6 +219,7 @@ class LightMemory:
         self._last_activity_time = datetime.now().timestamp()
         self._is_consolidating = False
         self._consolidation_lock = threading.Lock()
+        self._db_write_lock = threading.Lock()
         
         if getattr(self.config, 'autonomous_sleep', False):
             self._sleep_detector_thread = threading.Thread(target=self._sleep_detector_worker, daemon=True)
@@ -579,11 +580,12 @@ class LightMemory:
                     "consolidated": mem_obj.consolidated,
                     "user_id": mem_obj.user_id,
                 }
-                self.embedding_retriever.insert(
-                    vectors = [embedding_vector],
-                    payloads = [payload],
-                    ids = [ids],
-                )
+                with self._db_write_lock:
+                    self.embedding_retriever.insert(
+                        vectors = [embedding_vector],
+                        payloads = [payload],
+                        ids = [ids],
+                    )
                 inserted_count += 1
 
             self.logger.info(f"[{call_id}] Successfully inserted {inserted_count} entries to vector database")
@@ -625,7 +627,7 @@ class LightMemory:
         nonempty_queue_count = 0
         empty_queue_count = 0
         lock = threading.Lock()
-        write_lock = threading.Lock()
+        
         def _update_queue_construction(entry):
             nonlocal updated_count, skipped_count, nonempty_queue_count, empty_queue_count
             eid = entry["id"]
@@ -667,7 +669,7 @@ class LightMemory:
                     empty_queue_count += 1
                 self.logger.debug(f"[{call_id}] Entry {eid} has no candidates after filtering (hits may be only itself)")
 
-            with write_lock:
+            with self._db_write_lock:
                 self.embedding_retriever.update(vector_id=eid, vector=vec, payload=new_payload)
 
             with lock:
@@ -705,7 +707,7 @@ class LightMemory:
         deleted_count = 0
         skipped_count = 0
         lock = threading.Lock() # still needed for local counters below
-        write_lock = threading.Lock()
+        
         update_token_stats = {
             "calls": 0,
             "prompt_tokens": 0,
@@ -767,7 +769,7 @@ class LightMemory:
             # ==================== token consumption ====================
             action = updated_entry.get("action")
             if action == "delete":
-                with write_lock:
+                with self._db_write_lock:
                     self.embedding_retriever.delete(eid)
                 with lock:
                     deleted_count += 1
@@ -776,7 +778,7 @@ class LightMemory:
                 new_payload = dict(payload)
                 new_payload["memory"] = updated_entry.get("new_memory")
                 vector = entry.get("vector")
-                with write_lock:
+                with self._db_write_lock:
                     self.embedding_retriever.update(vector_id=eid, vector=vector, payload=new_payload)
                 with lock:
                     updated_count += 1
