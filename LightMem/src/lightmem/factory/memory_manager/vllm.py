@@ -86,7 +86,7 @@ class VllmManager:
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "max_tokens": min(self.config.max_tokens, 1024),  # Cap max tokens to prevent infinite loops
+            "max_tokens": self.config.max_tokens,  # Restored full max_tokens, relying on penalties to prevent loops
             "top_p": self.config.top_p,
             "frequency_penalty": 1.2,  # Added to prevent small models from endless repetitive JSON generation
             "presence_penalty": 0.5,
