@@ -1,24 +1,54 @@
 from typing import Dict, Optional, List, Any
 import torch, numpy as np
+import requests
 from transformers import AutoTokenizer, AutoModel
 
 class LlmLingua2Segmenter:
-    def __init__(self, config: Optional[Dict] = None, shared: bool = False, compressor=None):
+    def __init__(self, config: Any = None, shared: bool = False, compressor=None):
         self.config = config
 
-        if shared is False:
+        if getattr(self.config, 'use_server', False):
+            self.server_url = self.config.server_url
+            self.model = None
+            self.tokenizer = None # Use lightweight word-count fallback to save RAM
+            self.buffer_len = 512
+            self._lock = None
+        elif shared is False or compressor is None or getattr(compressor, "inner_compressor", None) is None:
+            # Need local model
+            cfg_dict = getattr(self.config, "configs", {}) or {}
+            model_name = cfg_dict.get("model_name")
+            if not model_name and compressor and hasattr(compressor, "config") and hasattr(compressor.config, "llmlingua_config"):
+                model_name = compressor.config.llmlingua_config.get("model_name")
+            if not model_name:
+                model_name = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
+                
+            device_map = cfg_dict.get("device_map")
+            if not device_map and compressor and hasattr(compressor, "config") and hasattr(compressor.config, "llmlingua_config"):
+                device_map = compressor.config.llmlingua_config.get("device_map", "cpu")
+
             self.model = AutoModel.from_pretrained(
-                pretrained_model_name_or_path=self.config["model_name"],
-                device_map=self.config.get("device_map", None),
-                torch_dtype=self.config.get("torch_dtype", None),
-                **self.config.get("model_config", {})
+                pretrained_model_name_or_path=model_name,
+                device_map=device_map,
+                torch_dtype=cfg_dict.get("torch_dtype", None),
+                **cfg_dict.get("model_config", {})
             ).eval()
-            self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
-            self.buffer_len = self.config.get("buffer_len", 512)
-        elif compressor is not None:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.buffer_len = cfg_dict.get("buffer_len", 512)
+            self._lock = None
+        else:
             self.model = compressor.inner_compressor.model
             self.tokenizer = compressor.inner_compressor.tokenizer
             self.buffer_len = getattr(self.model.config, "max_position_embeddings", 512)
+            self._lock = getattr(compressor, "_lock", None)
+
+        cfg_dict = getattr(self.config, "configs", {}) or {}
+        self.layers = cfg_dict.get("layers", [8, 9, 10, 11])
+
+    def _call_model(self, *args, **kwargs):
+        if self._lock:
+            with self._lock:
+                return self.model(*args, **kwargs)
+        return self.model(*args, **kwargs)
 
         self.layers = self.config.get("layers", [8, 9, 10, 11])
 
@@ -44,10 +74,17 @@ class LlmLingua2Segmenter:
         seq_len = len(input_ids)
 
         input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+        # Hard truncate to model's capacity to prevent hangs
+        if input_tensor.shape[1] > self.buffer_len:
+            # print(f"DEBUG: Truncating segmenter input from {input_tensor.shape[1]} to {self.buffer_len}")
+            input_tensor = input_tensor[:, :self.buffer_len]
+            
         attention_mask = torch.ones_like(input_tensor, device=device)
 
         with torch.no_grad():
-            outputs = model(input_tensor, attention_mask=attention_mask, output_attentions=True, return_dict=True)
+            # print("DEBUG: Segmenter entering LLMLingua-2 model call...")
+            outputs = self._call_model(input_tensor, attention_mask=attention_mask, output_attentions=True, return_dict=True)
+            # print("DEBUG: Segmenter exited LLMLingua-2 model call.")
             attentions = outputs.attentions
 
         selected = [attentions[i] for i in self.layers]
@@ -104,10 +141,26 @@ class LlmLingua2Segmenter:
 
         return M
 
-    def propose_cut(self, buffer_texts: List[str]) -> Dict[str, Any]:
+    def propose_cut(self, buffer_texts: List[str]) -> List[int]:
         n = len(buffer_texts)
         if n == 0:
-            return {"boundaries": [0], "cut_index": 0}
+            return []
+
+        if getattr(self.config, 'use_server', False):
+            try:
+                response = requests.post(
+                    self.server_url,
+                    json={
+                        "buffer_texts": buffer_texts,
+                        "layers": self.layers
+                    },
+                    timeout=30
+                )
+                response.raise_for_status()
+                return response.json()["boundaries"]
+            except Exception as e:
+                print(f"Server segmentation error: {e}")
+                return []
 
         M = self.sentence_level_attention(buffer_texts)
         outer = [M[i, i-1] for i in range(1, n)]

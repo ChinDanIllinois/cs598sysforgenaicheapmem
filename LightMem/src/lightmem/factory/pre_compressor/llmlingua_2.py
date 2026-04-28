@@ -1,3 +1,5 @@
+import threading
+import requests
 from typing import Dict, Optional, List, Union, Any
 from transformers import PreTrainedTokenizerBase
 
@@ -7,6 +9,11 @@ from lightmem.configs.pre_compressor.llmlingua_2 import LlmLingua2Config
 class LlmLingua2Compressor:
     def __init__(self, config: Optional[LlmLingua2Config] = None):
         self.config = config
+
+        if getattr(self.config, 'use_server', False):
+            self.server_url = self.config.server_url
+            self._compressor = None
+            return
 
         try:
             import importlib
@@ -18,6 +25,7 @@ class LlmLingua2Compressor:
                 "Or for the latest version: pip install git+https://github.com/microsoft/LLMLingua.git"
             )
 
+        self._lock = threading.Lock()
         try:
             from llmlingua import PromptCompressor
             if config.llmlingua_config['use_llmlingua2'] is True:
@@ -34,6 +42,78 @@ class LlmLingua2Compressor:
                 )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize LlmLingua2Compressor: {str(e)}")
+
+    def compress_batch(
+        self,
+        batch_of_messages: List[List[Dict[str, str]]],
+        tokenizer: Union[PreTrainedTokenizerBase, Any, None] = None,
+    ) -> List[List[Dict[str, str]]]:
+        """
+        Compress a batch of message lists (cross-tenant batching).
+        """
+        # Flatten all messages to compress them in one GPU call if possible
+        all_contents = []
+        mapping = [] # (batch_idx, msg_idx)
+        
+        for b_idx, messages in enumerate(batch_of_messages):
+            for m_idx, mes in enumerate(messages):
+                content = mes.get('content', '').strip()
+                if content:
+                    # Truncate to avoid model hangs on long inputs
+                    # LLMLingua-2 usually has a 512 context limit
+                    if len(content) > 2000: # Heuristic for ~500 tokens
+                        content = content[:2000]
+                    all_contents.append(content)
+                    mapping.append((b_idx, m_idx))
+
+        if not all_contents:
+            return batch_of_messages
+
+        if getattr(self.config, 'use_server', False):
+            try:
+                response = requests.post(
+                    self.server_url, 
+                    json={
+                        "contexts": all_contents,
+                        "rate": self.config.compress_config.get('rate', 0.8),
+                        "target_token": self.config.compress_config.get('target_token', -1)
+                    },
+                    timeout=30
+                )
+                response.raise_for_status()
+                compressed_prompts = response.json()["compressed_prompts"]
+            except Exception as e:
+                print(f"Server batch compression error: {e}")
+                return batch_of_messages
+        else:
+            # Run compression in one big batch
+            # Safety: Ensure total tokens doesn't cause a hang if the model is picky
+            compress_config = {
+                'context': all_contents,
+                **self.config.compress_config
+            }
+            
+            try:
+                # LLMLingua-2 PromptCompressor.compress_prompt handles lists in 'context'
+                with self._lock:
+                    results = self._compressor.compress_prompt(**compress_config)
+                compressed_prompts = results['compressed_prompt']
+                
+                # If it's a single string (only 1 message total), wrap it in a list
+                if isinstance(compressed_prompts, str):
+                    compressed_prompts = [compressed_prompts]
+    
+            except Exception as e:
+                print(f"Batch compression error: {e}")
+                return batch_of_messages
+                # Fallback is to return original (partially updated or not)
+
+        # Map results back to original messages
+        for i, (b_idx, m_idx) in enumerate(mapping):
+            if i < len(compressed_prompts):
+                batch_of_messages[b_idx][m_idx]['content'] = compressed_prompts[i].strip()
+
+        return batch_of_messages
 
     def compress(
         self,
@@ -57,26 +137,58 @@ class LlmLingua2Compressor:
                 # If content is empty, it doesn't need compression
                 continue
 
-            compress_config = {
-                'context': [content],
-                **self.config.compress_config
-            }
-
-            try:
-                comp_content = self._compressor.compress_prompt(**compress_config)['compressed_prompt']
-            except Exception as e:
-                print(f"compress error, skip this message: {e}")
-                comp_content = content  # Keep the original content if compression fails
+            if getattr(self.config, 'use_server', False):
+                try:
+                    response = requests.post(
+                        self.server_url, 
+                        json={
+                            "contexts": [content],
+                            "rate": self.config.compress_config.get('rate', 0.8),
+                            "target_token": self.config.compress_config.get('target_token', -1)
+                        },
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    comp_content = response.json()["compressed_prompts"][0]
+                except Exception as e:
+                    print(f"Server single compress error, skip this message: {e}")
+                    comp_content = content
+            else:
+                compress_config = {
+                    'context': [content],
+                    **self.config.compress_config
+                }
+    
+                try:
+                    with self._lock:
+                        comp_content = self._compressor.compress_prompt(**compress_config)['compressed_prompt']
+                except Exception as e:
+                    print(f"compress error, skip this message: {e}")
+                    comp_content = content  # Keep the original content if compression fails
 
             # Check if the compressed content is still too long
             if tokenizer is not None:
                 try:
                     while len(tokenizer.encode(comp_content)) >= 512 and comp_content.strip():
-                        new_compress_config = {
-                            'context': comp_content,
-                            **self.config.compress_config
-                        }
-                        comp_content = self._compressor.compress_prompt(**new_compress_config)['compressed_prompt']
+                        if getattr(self.config, 'use_server', False):
+                            response = requests.post(
+                                self.server_url, 
+                                json={
+                                    "contexts": [comp_content],
+                                    "rate": self.config.compress_config.get('rate', 0.8),
+                                    "target_token": self.config.compress_config.get('target_token', -1)
+                                },
+                                timeout=30
+                            )
+                            response.raise_for_status()
+                            comp_content = response.json()["compressed_prompts"][0]
+                        else:
+                            new_compress_config = {
+                                'context': comp_content,
+                                **self.config.compress_config
+                            }
+                            with self._lock:
+                                comp_content = self._compressor.compress_prompt(**new_compress_config)['compressed_prompt']
                 except Exception as e:
                     print(f"secondary compress error: {e}")
                     # If an error occurs, exit the loop and keep the current compression result

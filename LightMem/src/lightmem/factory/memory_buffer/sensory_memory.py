@@ -10,30 +10,37 @@ class SenMemBufferManager:
         self.token_count: int = 0
 
     def _recount_tokens(self) -> None:
-        self.token_count = sum(len(self.tokenizer.encode(m["content"])) for m in self.buffer if m["role"]=="user")
+        if self.tokenizer:
+            self.token_count = sum(len(self.tokenizer.encode(m["content"])) for m in self.buffer if m["role"]=="user")
+        else:
+            self.token_count = sum(len(m["content"].split()) for m in self.buffer if m["role"]=="user")
 
-    def add_messages(self, messages: List[Dict], segmenter, text_embedder) -> None:
+    def add_messages(self, messages: List[Dict], segmenter, text_embedder) -> List[List[Dict]]:
         all_segments = []
         self.big_buffer.extend(messages)
 
         while self.big_buffer:
-            processed_messages = []
-            for msg in self.big_buffer:
-                if msg["role"] == "user":
+            msg = self.big_buffer[0]
+            if msg["role"] == "user":
+                # Ensure tokenizer exists before using it
+                if self.tokenizer:
                     cur_token_count = len(self.tokenizer.encode(msg["content"]))
-                    if self.token_count + cur_token_count <= self.max_tokens:
-                        self.buffer.append(msg)
-                        self.token_count += cur_token_count
-                        processed_messages.append(msg)
-                    else:
-                        segments = self.cut_with_segmenter(segmenter, text_embedder)
-                        all_segments.extend(segments)
-                        break
                 else:
-                    self.buffer.append(msg)
-                    processed_messages.append(msg)
-            for msg in processed_messages:
-                self.big_buffer.remove(msg)
+                    # Fallback if tokenizer is missing
+                    cur_token_count = len(msg["content"].split())
+                
+                if self.token_count + cur_token_count > self.max_tokens and self.token_count > 0:
+                    # Flush current buffer to make room
+                    segments = self.cut_with_segmenter(segmenter, text_embedder)
+                    all_segments.extend(segments)
+                    # Loop continues, will try to add msg again to the now-empty buffer
+                else:
+                    # Buffer has room, or msg is just individually huge (must add it anyway)
+                    self.buffer.append(self.big_buffer.pop(0))
+                    self.token_count += cur_token_count
+            else:
+                # Assistant messages don't count towards the trigger but stay with the preceding user message
+                self.buffer.append(self.big_buffer.pop(0))
 
         return all_segments
 
@@ -48,6 +55,13 @@ class SenMemBufferManager:
         """
         segments = []
         buffer_texts = [m["content"] for m in self.buffer if m["role"] == "user"]
+        if not buffer_texts:
+            if self.buffer:
+                segments.append(self.buffer.copy())
+                self.buffer.clear()
+                self.token_count = 0
+            return segments
+
         boundaries = segmenter.propose_cut(buffer_texts)
 
         if not boundaries:
@@ -57,10 +71,13 @@ class SenMemBufferManager:
             return segments
 
         turns = []
-        for i in range(0, len(self.buffer), 2):
+        i = 0
+        while i < len(self.buffer):
             user_msg = self.buffer[i]["content"]
-            assistant_msg = self.buffer[i + 1]["content"]
-            turns.append(user_msg + " " + assistant_msg)
+            # Safely handle odd message counts by providing a placeholder for the assistant
+            assistant_msg = self.buffer[i + 1]["content"] if (i + 1) < len(self.buffer) else ""
+            turns.append(f"{user_msg} {assistant_msg}")
+            i += 2
 
         embeddings = []
         for turn in turns:

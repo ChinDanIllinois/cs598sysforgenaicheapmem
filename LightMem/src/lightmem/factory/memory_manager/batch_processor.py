@@ -7,6 +7,7 @@ import concurrent.futures
 import requests
 from typing import List, Dict, Any, Optional, Union
 from enum import Enum
+from google import genai
 from .batch_manager import BatchManager
 
 try:
@@ -495,5 +496,75 @@ class VllmBatchProcessor(BatchManager):
         self._stop_event.set()
         if self.state_monitor:
             self.state_monitor.stop()
+        if self._monitor_thread.is_alive():
+            self._monitor_thread.join()
+
+class LocalBatchProcessor:
+    """
+    Coalesces local model calls from multiple threads into batches.
+    Useful for local GPU models like LLMLingua-2 or local Embedders.
+    """
+    def __init__(self, process_func, batch_size: int, timeout: float, logger: Any):
+        self.process_func = process_func
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.logger = logger
+        
+        self._buffer: List[Any] = []
+        self._futures: List[concurrent.futures.Future] = []
+        self._lock = threading.Lock()
+        self._last_flush_time = time.time()
+        
+        self._stop_event = threading.Event()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def add_request(self, data: Any) -> concurrent.futures.Future:
+        future = concurrent.futures.Future()
+        with self._lock:
+            self._buffer.append(data)
+            self._futures.append(future)
+            
+            if len(self._buffer) >= self.batch_size:
+                self._flush()
+            elif len(self._buffer) == 1:
+                self._last_flush_time = time.time()
+        return future
+
+    def _monitor_loop(self):
+        while not self._stop_event.is_set():
+            time.sleep(0.01) # High frequency polling for local batching
+            with self._lock:
+                if self._buffer and (time.time() - self._last_flush_time >= self.timeout):
+                    self._flush()
+
+    def _flush(self):
+        if not self._buffer: return
+        
+        batch_data = list(self._buffer)
+        batch_futures = list(self._futures)
+        
+        self._buffer = []
+        self._futures = []
+        self._last_flush_time = time.time()
+        
+        # We run the actual local inference in a separate thread to not block the dispatcher
+        threading.Thread(target=self._run_batch, args=(batch_data, batch_futures), daemon=True).start()
+
+    def _run_batch(self, data_list, futures):
+        try:
+            # The process_func must be able to handle a list of inputs
+            results = self.process_func(data_list)
+            
+            for i, res in enumerate(results):
+                if i < len(futures):
+                    futures[i].set_result(res)
+        except Exception as e:
+            self.logger.error(f"Local batch processing error: {e}")
+            for f in futures:
+                if not f.done(): f.set_exception(e)
+
+    def stop(self):
+        self._stop_event.set()
         if self._monitor_thread.is_alive():
             self._monitor_thread.join()

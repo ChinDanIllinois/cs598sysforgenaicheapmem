@@ -107,6 +107,17 @@ def parse_args():
         help="LLM batch timeout in seconds. Default: 10.",
     )
     parser.add_argument(
+        "--vllm-adaptive-shaping",
+        action="store_true",
+        help="Enable adaptive request shaping for vLLM (monitors engine metrics).",
+    )
+    parser.add_argument(
+        "--vllm-metrics-url",
+        type=str,
+        default="",
+        help="Custom metrics URL for vLLM (defaults to VLLM_BASE_URL/metrics).",
+    )
+    parser.add_argument(
         "--rpm",
         type=float,
         default=0,
@@ -298,6 +309,8 @@ CONFIG = {
     "rpm":                args.rpm,
     "llm_batch_size":     args.llm_batch_size,
     "llm_batch_timeout":  args.llm_batch_timeout,
+    "vllm_adaptive_shaping": args.vllm_adaptive_shaping,
+    "vllm_metrics_url":   args.vllm_metrics_url,
 }
 
 rate_limiter = AsyncRateLimiter(CONFIG["rpm"])
@@ -344,6 +357,8 @@ def _memory_manager_config_vllm() -> dict:
             "vllm_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
             "llm_batch_size": CONFIG["llm_batch_size"],
             "llm_batch_timeout": CONFIG["llm_batch_timeout"],
+            "vllm_adaptive_shaping": CONFIG["vllm_adaptive_shaping"],
+            "vllm_metrics_url": CONFIG["vllm_metrics_url"] if CONFIG["vllm_metrics_url"] else None,
         },
     }
 
