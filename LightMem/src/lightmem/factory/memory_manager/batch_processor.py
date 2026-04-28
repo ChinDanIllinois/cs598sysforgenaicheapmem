@@ -9,8 +9,15 @@ from typing import List, Dict, Any, Optional, Union
 from enum import Enum
 from .batch_manager import BatchManager
 
+try:
+    import google.generativeai as genai
+    from google.generativeai import types
+except ImportError:
+    genai = None
+    types = None
+
 class GeminiBatchProcessor(BatchManager):
-    def __init__(self, client: genai.Client, model: str, batch_size: int, timeout: int, poll_interval: int, api_key: str, logger: Any):
+    def __init__(self, client: Any, model: str, batch_size: int, timeout: int, poll_interval: int, api_key: str, logger: Any):
         self.client = client
         self.model = model
         self.batch_size = batch_size
