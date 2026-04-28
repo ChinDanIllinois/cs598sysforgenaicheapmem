@@ -264,6 +264,7 @@ class LightMemory:
 
         call_id = f"add_memory_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
+        self._last_activity_time = datetime.now().timestamp()
         self.logger.info(f"force_segment={force_segment}, force_extract={force_extract}")
         result = {
             "add_input_prompt": [],
@@ -454,6 +455,34 @@ class LightMemory:
 
     def online_update(self, memory_list: List):
         return None
+
+    def _sleep_detector_worker(self):
+        import time
+        self.logger.info("Sleep detector worker started. Monitoring for system inactivity.")
+        check_interval = getattr(self.config, 'sleep_check_interval_sec', 60)
+        idle_threshold = getattr(self.config, 'sleep_idle_threshold_sec', 300)
+        
+        while True:
+            time.sleep(check_interval)
+            current_time = datetime.now().timestamp()
+            idle_time = current_time - self._last_activity_time
+            
+            if idle_time > idle_threshold:
+                with self._consolidation_lock:
+                    if not self._is_consolidating:
+                        self._is_consolidating = True
+                        try:
+                            self.logger.info(f"System idle for {idle_time:.2f}s (threshold {idle_threshold}s). Triggering autonomous consolidation.")
+                            # Trigger offline update
+                            self.construct_update_queue_all_entries(top_k=20, keep_top_n=10)
+                            self.offline_update_all_entries(score_threshold=0.8)
+                            
+                            # Reset activity time to avoid immediate re-triggering if system remains idle
+                            self._last_activity_time = datetime.now().timestamp()
+                        except Exception as e:
+                            self.logger.error(f"Error during autonomous consolidation: {e}")
+                        finally:
+                            self._is_consolidating = False
 
     def _batch_worker(self):
         self.logger.info("Batch worker dispatcher started. Listening for extraction jobs.")
@@ -800,6 +829,7 @@ class LightMemory:
         """
         call_id = f"retrieve_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
+        self._last_activity_time = datetime.now().timestamp()
         self.logger.info(f"[{call_id}] Query: {query}")
         self.logger.info(f"[{call_id}] Parameters: limit={limit}, filters={filters}")
 
