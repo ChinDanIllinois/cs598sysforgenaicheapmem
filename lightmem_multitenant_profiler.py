@@ -155,6 +155,7 @@ def parse_args():
     # Metadata & Logging
     parser.add_argument("--run-name", type=str, default="multitenant_run")
     parser.add_argument("--port", type=int, default=8052, help="Dashboard port.")
+    parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default=None, help="Device for local models (llmlingua, embedding, segmenter).")
     
     return parser.parse_args()
 
@@ -590,7 +591,10 @@ def setup_lightmem(args):
     cfg = builder(args)
     
     # Performance choices: vLLM backend gets GPU for local models or remote endpoints
-    device = "cuda" if args.provider == "vllm" else "cpu"
+    if args.device:
+        device = args.device
+    else:
+        device = "cuda" if args.provider == "vllm" else "cpu"
     
     # Configure Embedder
     if args.provider == "vllm" and args.vllm_embed_url:
@@ -635,7 +639,10 @@ def setup_lightmem(args):
         "topic_segmenter": {
             "model_name": "llmlingua-2",
             "use_server": args.use_server_compress,
-            "server_url": "http://localhost:8090/segment"
+            "server_url": "http://localhost:8090/segment",
+            "configs": {
+                "device_map": device
+            }
         },
         "messages_use": "user_only", "metadata_generate": True, "text_summary": True, "memory_manager": cfg, "extract_threshold": 0.1,
         "index_strategy": "embedding", 
