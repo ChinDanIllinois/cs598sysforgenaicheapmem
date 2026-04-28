@@ -79,11 +79,11 @@ class SenMemBufferManager:
             turns.append(f"{user_msg} {assistant_msg}")
             i += 2
 
-        embeddings = []
-        for turn in turns:
-            emb = text_embedder.embed(turn)
-            embeddings.append(np.array(emb, dtype=np.float32))
-        embeddings = np.vstack(embeddings)
+        if turns:
+            embeddings = text_embedder.embed(turns)
+            embeddings = np.array(embeddings, dtype=np.float32)
+        else:
+            embeddings = np.empty((0, 0))
 
         fine_boundaries = []
         threshold = 0.2

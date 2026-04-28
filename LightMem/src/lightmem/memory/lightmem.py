@@ -515,14 +515,14 @@ class LightMemory:
             save_memory_entries(memory_list, "memory_entries.json")
 
         if self.config.index_strategy in ["embedding", "hybrid"]:
-            inserted_count = 0
             self.logger.info(f"[{call_id}] Starting embedding and insertion to vector database")
-            for mem_obj in memory_list:
-                embedding_vector = self.text_embedder.embed(mem_obj.memory)
-                ids = mem_obj.id
-                while self.embedding_retriever.exists(ids):
-                    ids = str(uuid.uuid4())
-                    mem_obj.id = ids
+            memories_to_embed = [mem_obj.memory for mem_obj in memory_list]
+            embedding_vectors = self.text_embedder.embed(memories_to_embed)
+            
+            for mem_obj, embedding_vector in zip(memory_list, embedding_vectors):
+                
+                # 2. Collect ID and payload
+                eid = mem_obj.id
                 payload = {
                     "time_stamp": mem_obj.time_stamp,
                     "float_time_stamp": mem_obj.float_time_stamp,
@@ -540,14 +540,18 @@ class LightMemory:
                     "consolidated": mem_obj.consolidated,
                     "user_id": mem_obj.user_id,
                 }
-                self.embedding_retriever.insert(
-                    vectors = [embedding_vector],
-                    payloads = [payload],
-                    ids = [ids],
-                )
-                inserted_count += 1
+                
+                vectors.append(embedding_vector)
+                payloads.append(payload)
+                ids.append(eid)
 
-            self.logger.info(f"[{call_id}] Successfully inserted {inserted_count} entries to vector database")
+            if vectors:
+                self.embedding_retriever.insert(
+                    vectors=vectors,
+                    payloads=payloads,
+                    ids=ids,
+                )
+                self.logger.info(f"[{call_id}] Successfully inserted {len(vectors)} entries to vector database")
             if construct_update_queue_trigger:
                 self.logger.info(f"[{call_id}] Triggering update queue construction")
                 self.construct_update_queue_all_entries(

@@ -1,8 +1,9 @@
-from openai import OpenAI
-from typing import Optional, Literal
-from sentence_transformers import SentenceTransformer
-import numpy as np
+import threading
 import time
+import numpy as np
+from typing import Optional, Literal, List, Union
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from lightmem.configs.text_embedder.base_config import BaseTextEmbedderConfig
 
 class TextEmbedderHuggingface:
@@ -11,6 +12,7 @@ class TextEmbedderHuggingface:
         self.total_calls = 0
         self.total_tokens = 0
         self.total_time = 0.0
+        self._lock = threading.Lock() 
         if config.huggingface_base_url:
             self.client = OpenAI(base_url=config.huggingface_base_url)
             self.use_api = True
@@ -27,38 +29,36 @@ class TextEmbedderHuggingface:
 
     @staticmethod
     def validate_config(config):
-        """
-        Validate whether the provided config dictionary contains the required configuration items.
-        Assume that the HuggingFace embedder requires at least 'model_name'.
-        """
         required_keys = ['model_name']
         missing = [key for key in required_keys if key not in config]
         if missing:
             raise ValueError(f"Missing required config keys for HuggingFace embedder: {missing}")
 
-    def embed(self, text):
+    def embed(self, text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
         """
-        Get the embedding for the given text using Hugging Face.
-
-        Args:
-            text (str): The text to embed.
-        Returns:
-            list: The embedding vector.
+        Get the embedding for the given text or list of texts.
         """
+        is_batch = isinstance(text, list)
         self.total_calls += 1
         start_time = time.perf_counter()
-        if self.config.huggingface_base_url:
+        
+        if self.use_api:
+            # TEI or other API handles batching natively
             response = self.client.embeddings.create(input=text, model="tei")
             self.total_time += time.perf_counter() - start_time
             self.total_tokens += getattr(response.usage, 'total_tokens', 0)
+            if is_batch:
+                return [d.embedding for d in response.data]
             return response.data[0].embedding
         else:
-            result = self.model.encode(text, convert_to_numpy=True)
+            # Local SentenceTransformer
+            with self._lock:
+                result = self.model.encode(text, convert_to_numpy=True)
+                
             self.total_time += time.perf_counter() - start_time
-            if isinstance(result, np.ndarray):
+            if is_batch:
                 return result.tolist()
-            else:
-                return result
+            return result.tolist() if isinstance(result, np.ndarray) else result
             
     def get_stats(self):
         return {
