@@ -86,7 +86,7 @@ class VllmManager:
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "max_tokens": 8192,  # Cap at 8k to leave room for the input prompt (Total must be < 16k)
+            "max_tokens": 4096,  # Set to 4096 as requested
             "top_p": self.config.top_p,
             "frequency_penalty": 1.2,  # Added to prevent small models from endless repetitive JSON generation
             "presence_penalty": 0.5,
