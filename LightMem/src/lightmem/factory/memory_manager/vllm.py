@@ -86,7 +86,7 @@ class VllmManager:
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens // 2,  # Cap at half of config to prevent model throttling
+            "max_tokens": 4096,  # Safe middle-ground cap
             "top_p": self.config.top_p,
             "frequency_penalty": 1.2,  # Added to prevent small models from endless repetitive JSON generation
             "presence_penalty": 0.5,
