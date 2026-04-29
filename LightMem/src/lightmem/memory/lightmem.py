@@ -35,6 +35,7 @@ import queue
 from lightmem.memory.tenant import TenantState
 from lightmem.memory.queue_types import ExtractionJob
 from lightmem.factory.memory_manager.batch_processor import LocalBatchProcessor
+import time
 
 
 class MessageNormalizer:
