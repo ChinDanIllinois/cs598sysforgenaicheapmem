@@ -17,6 +17,8 @@ import textwrap
 import time
 import uuid
 import threading
+import faulthandler
+faulthandler.enable()
 from typing import List, Dict, Any, Tuple
 from collections import deque
 
@@ -38,6 +40,7 @@ logging.getLogger('dash').setLevel(logging.ERROR)
 logging.getLogger('mem0').setLevel(logging.ERROR)
 
 dotenv.load_dotenv()
+os.environ["MEM0_TELEMETRY"] = "False"
 
 # ============================================================
 # UTILS — RATE LIMITING
@@ -439,7 +442,6 @@ async def run_simulation(events, args, memory, rate_limiter):
     mon_task = asyncio.create_task(monitor_throughput(GLOBAL_METRICS, stop_mon))
     tasks = []
     user_locks = {}
-    sqlite_lock = threading.Lock()
     
     async def run_event(event):
         uid = event["user_id"]
@@ -464,11 +466,10 @@ async def run_simulation(events, args, memory, rate_limiter):
                 # We use a thread lock because Mem0's internal SQLite/metadata storage 
                 # is not thread-safe at high concurrency (64).
                 def locked_call():
-                    with sqlite_lock:
-                        if is_archive:
-                            return memory.add(content, user_id=event["user_id"])
-                        else:
-                            return memory.search(content, user_id=event["user_id"])
+                    if is_archive:
+                        return memory.add(content, user_id=event["user_id"])
+                    else:
+                        return memory.search(content, user_id=event["user_id"])
 
                 await asyncio.to_thread(locked_call)
                 
@@ -515,8 +516,8 @@ def setup_mem0(args):
         "vector_store": {
             "provider": "qdrant",
             "config": {
-                "collection_name": f"mem0_mt_{uuid.uuid4().hex[:4]}",
-                "path": f"{os.getenv('QDRANT_DATA_DIR', './qdrant_data')}/mem0_multitenant",
+                "url": "http://localhost:6333",
+                "collection_name": "mem0_mt_test",
                 "embedding_model_dims": 384
             }
         },
