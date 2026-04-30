@@ -240,8 +240,8 @@ class LightMemory:
 
     def _sleep_detector_worker(self):
         """Background thread to detect idle time and trigger consolidation."""
-        idle_threshold = getattr(self.config, 'sleep_idle_threshold', 5.0)
-        check_interval = getattr(self.config, 'sleep_check_interval', 2.0)
+        idle_threshold = getattr(self.config, 'sleep_idle_threshold_sec', 5.0)
+        check_interval = getattr(self.config, 'sleep_check_interval_sec', 2.0)
         while True:
             time.sleep(check_interval)
             time_since_last = datetime.now().timestamp() - self._last_activity_time
