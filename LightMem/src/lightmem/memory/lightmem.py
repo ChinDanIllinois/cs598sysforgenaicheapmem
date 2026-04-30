@@ -5,9 +5,12 @@ import concurrent
 import logging
 import json
 import threading
+import time as _time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Literal, Optional, List, Tuple, Union
+
 from pydantic import ValidationError
+
 from lightmem.configs.base import BaseMemoryConfigs
 from lightmem.factory.pre_compressor.factory import PreCompressorFactory
 from lightmem.factory.topic_segmenter.factory import TopicSegmenterFactory
@@ -18,7 +21,14 @@ from lightmem.factory.retriever.embeddingretriever.factory import EmbeddingRetri
 from lightmem.factory.retriever.embeddingretriever.qdrant import QdrantConfig
 from lightmem.factory.memory_buffer.sensory_memory import SenMemBufferManager
 from lightmem.factory.memory_buffer.short_term_memory import ShortMemBufferManager
-from lightmem.memory.utils import MemoryEntry, assign_sequence_numbers_with_timestamps, save_memory_entries,convert_extraction_results_to_memory_entries,normalize_extraction_prompts,process_extraction_results
+from lightmem.memory.utils import (
+    MemoryEntry,
+    assign_sequence_numbers_with_timestamps,
+    save_memory_entries,
+    convert_extraction_results_to_memory_entries,
+    normalize_extraction_prompts,
+    process_extraction_results,
+)
 from lightmem.memory.prompts import METADATA_GENERATE_PROMPT, UPDATE_PROMPT
 from lightmem.configs.logging.utils import get_logger
 import queue
@@ -27,8 +37,8 @@ from lightmem.memory.queue_types import ExtractionJob
 from lightmem.factory.memory_manager.batch_processor import LocalBatchProcessor
 import time
 
-class MessageNormalizer:
 
+class MessageNormalizer:
     _SESSION_RE = re.compile(
         r'(?P<date>\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*\((?P<weekday>[^)]+)\)\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?)'
     )
@@ -56,7 +66,10 @@ class MessageNormalizer:
             dt = datetime.fromisoformat(raw_ts)
             return dt, dt.strftime("%a")
         except Exception as e:
-            raise ValueError(f"{str(e)}: Failed to parse session time format: '{raw_ts}'. Expected something like '2023/05/20 (Sat) 00:44'")
+            raise ValueError(
+                f"{str(e)}: Failed to parse session time format: '{raw_ts}'. "
+                "Expected something like '2023/05/20 (Sat) 00:44'"
+            )
 
     def normalize_messages(self, messages: Any) -> List[Dict[str, Any]]:
         """
@@ -66,13 +79,14 @@ class MessageNormalizer:
           - If list -> multiple messages (each must be a dict and contain 'time_stamp')
         Returns: List[Dict] (each item is a copied and enriched message)
         """
-        # Normalize input into a list
         if isinstance(messages, dict):
             messages_list = [messages]
         elif isinstance(messages, list):
             messages_list = messages
         elif isinstance(messages, str):
-            raise ValueError("Please provide messages as dict or list[dict], and ensure each dict contains a 'time_stamp' field (session-level).")
+            raise ValueError(
+                "Please provide messages as dict or list[dict], and ensure each dict contains a 'time_stamp' field (session-level)."
+            )
         else:
             raise ValueError("messages must be dict or list[dict] (or str, but not recommended).")
 
@@ -83,11 +97,12 @@ class MessageNormalizer:
                 raise ValueError("Each item in messages list must be a dict.")
             raw_ts = msg.get("time_stamp")
             if not raw_ts:
-                raise ValueError("Each message should contain a 'time_stamp' field (e.g., '2023/05/20 (Sat) 00:44').")
+                raise ValueError(
+                    "Each message should contain a 'time_stamp' field (e.g., '2023/05/20 (Sat) 00:44')."
+                )
 
             base_dt, weekday = self._parse_session_timestamp(raw_ts)
 
-            # Maintain incrementing time based on raw_ts as session key
             last_dt = self.last_timestamp_map.get(raw_ts)
             if last_dt is None:
                 new_dt = base_dt
@@ -108,38 +123,12 @@ class MessageNormalizer:
 
 class LightMemory:
     def __init__(self, config: BaseMemoryConfigs = BaseMemoryConfigs()):
-        
         """
         Initialize a LightMemory instance.
-
-        This constructor initializes various memory-related components based on the provided configuration (`config`), 
-        including the memory manager, optional pre-compressor, optional topic segmenter, text embedder, 
-        and retrievers based on the configured strategies.
-
-        This design supports flexible extension of the memory system, making it easy to integrate 
-        different processing and retrieval capabilities.
-
-        Args:
-            config (BaseMemoryConfigs): The configuration object for the memory system, 
-                containing initialization parameters for all submodules.
-
-        Components initialized:
-            - compressor (optional): Pre-compression model if pre_compress=True
-            - segmenter (optional): Topic segmentation model if topic_segment=True
-            - manager: Memory management model for metadata generation and text summarization
-            - text_embedder (optional): Text embedding model if index_strategy is 'embedding' or 'hybrid'
-            - retrieve_strategy (optional): Retrieval strategy ('context', 'embedding', or 'hybrid')
-            - context_retriever (optional): Context-based retriever if retrieve_strategy is 'context' or 'hybrid'
-            - embedding_retriever (optional): Embedding-based retriever if retrieve_strategy is 'embedding' or 'hybrid'
-            - graph (optional): Graph memory store if graph_mem is enabled
-
-        Note:
-            - Multimodal embedder initialization is currently commented out
-            - Graph memory initialization is conditional on graph_mem configuration
         """
         if config.logging is not None:
             config.logging.apply()
-        
+
         self.logger = get_logger("LightMemory")
         self.logger.info("Initializing LightMemory with provided configuration")
         self.token_stats = {
@@ -147,33 +136,25 @@ class LightMemory:
             "add_memory_prompt_tokens": 0,
             "add_memory_completion_tokens": 0,
             "add_memory_total_tokens": 0,
-            "add_memory_time": 0.0,
             "update_calls": 0,
             "update_prompt_tokens": 0,
             "update_completion_tokens": 0,
             "update_total_tokens": 0,
-            "update_time": 0.0,
+            "embedding_calls": 0,
+            "embedding_total_tokens": 0,
             "summarize_calls": 0,
             "summarize_prompt_tokens": 0,
             "summarize_completion_tokens": 0,
             "summarize_total_tokens": 0,
-            "summarize_time": 0.0,
-            "embedding_calls": 0,
-            "embedding_total_tokens": 0,
-            "embedding_time": 0.0,
-            # Per-stage timing for add_memory pipeline
             "stage_compress_time": 0.0,
             "stage_segment_time": 0.0,
             "stage_llm_extract_time": 0.0,
             "stage_db_insert_time": 0.0,
-            "add_memory_errors": 0,
-            "update_errors": 0,
-            "summarize_errors": 0,
         }
         self._token_stats_lock = threading.Lock()
         self._buffer_lock = threading.Lock()
         self.logger.info("Token statistics tracking initialized")
-        
+
         self.config = config
         self._tenants: Dict[str, TenantState] = {}
         self._tenants_lock = threading.Lock()
@@ -197,17 +178,19 @@ class LightMemory:
         if self.config.index_strategy == 'embedding' or self.config.index_strategy == 'hybrid':
             self.logger.info("Initializing text embedder")
             self.text_embedder = TextEmbedderFactory.from_config(self.config.text_embedder)
-        # if self.config.multimodal_embedder:
+
         self.retrieve_strategy = self.config.retrieve_strategy
         if self.retrieve_strategy in ["context", "hybrid"]:
             self.logger.info("Initializing context retriever")
             self.context_retriever = ContextRetrieverFactory.from_config(self.config.context_retriever)
+
         if self.retrieve_strategy in ["embedding", "hybrid"]:
             self.logger.info("Initializing embedding retriever")
             self.embedding_retriever = EmbeddingRetrieverFactory.from_config(self.config.embedding_retriever)
             if hasattr(self.config, 'summary_retriever') and self.config.summary_retriever is not None:
                 self.logger.info("Initializing summary retriever")
                 self.summary_retriever = EmbeddingRetrieverFactory.from_config(self.config.summary_retriever)
+
         if self.config.graph_mem:
             from .graph import GraphMem
             self.logger.info("Initializing graph memory")
@@ -279,14 +262,45 @@ class LightMemory:
 
 
     @classmethod
-    def from_config(cls, config: Dict[str,Any]):
+    def from_config(cls, config: Dict[str, Any]):
         try:
             configs = BaseMemoryConfigs(**config)
         except ValidationError as e:
             print(f"Configuration validation error: {e}")
             raise
         return cls(configs)
-    
+
+    def stream_compress(self, messages):
+        """Eagerly compress a message batch for streaming pre-computation mode."""
+        if not hasattr(self, "compressor") or self.compressor is None:
+            raise RuntimeError("No compressor is initialized for streaming pre-compression")
+
+        if isinstance(messages, dict):
+            messages_to_compress = [dict(messages)]
+        else:
+            messages_to_compress = [dict(m) for m in messages]
+
+        tokenizer = None
+        if hasattr(self, "segmenter") and hasattr(self.segmenter, "tokenizer"):
+            tokenizer = self.segmenter.tokenizer
+        elif hasattr(self.compressor, "tokenizer"):
+            tokenizer = self.compressor.tokenizer
+
+        compressed = self.compressor.compress(messages_to_compress, tokenizer)
+        return compressed
+
+    def precompute_stream_compression(self, messages):
+        """
+        Precompute compressed messages for streaming-mode benchmarking.
+        Current simple version just calls stream_compress directly.
+        """
+        return self.stream_compress(messages)
+
+    def ingest_message_stream(self, messages):
+        """
+        Public wrapper used by the benchmark to simulate streaming arrival.
+        """
+        return self.precompute_stream_compression(messages)
     
     def add_memory(
         self,
@@ -294,60 +308,18 @@ class LightMemory:
         user_id: str,
         METADATA_GENERATE_PROMPT: Optional[Union[str, Dict[str, str]]] = None,
         *,
-        force_segment: bool = False, 
+        force_segment: bool = False,
         force_extract: bool = False
     ):
         """
         Add new memory entries from message history.
-
-        This method serves as the main pipeline for constructing new memory units from 
-        incoming messages. It performs message normalization, optional pre-compression,
-        segmentation, and knowledge extraction to produce structured memory entries.
-
-        The process is as follows:
-          1. Normalize input messages with standardized timestamps and session tracking.
-          2. Optionally compress messages using the pre-defined compression model (if enabled).
-          3. If topic segmentation is enabled, split messages into coherent segments and add them to the sentence-level buffer.
-          4. Trigger memory extraction based on configured thresholds or forced flags.
-          5. Optionally perform metadata summarization using an external model if enabled.
-          6. Convert extracted results into `MemoryEntry` objects and update memory storage
-             (either in online or offline mode depending on configuration).
-
-        Args:
-            messages (dict or List[dict]): Input message(s) to process.
-            METADATA_GENERATE_PROMPT: Custom prompt(s) for extraction. Supports multiple formats:
-                - str: Legacy format for flat mode (single factual prompt)
-                    Example: METADATA_GENERATE_PROMPT="Your extraction prompt..."
-                - dict: New format supporting multiple perspectives
-                    For flat mode: {"factual": "..."}
-                    For event mode: {"factual": "...", "relational": "..."}
-                - None: Use default prompts based on self.config.extraction_mode
-            force_segment (bool, optional): If True, forces segmentation regardless of buffer conditions.
-            force_extract (bool, optional): If True, forces memory extraction even if thresholds are not met.
-
-        Returns:
-            dict: A dictionary containing the intermediate results of the memory addition pipeline.
-                  Typically includes:
-                    - `"add_input_prompt"`: List of input prompts used for metadata generation (if enabled)
-                    - `"add_output_prompt"`: Corresponding output results from metadata generation
-                    - `"api_call_nums"`: Number of API calls made for extraction/summarization
-                    - (In early termination cases) A segmentation result dict with keys such as
-                      `"triggered"`, `"cut_index"`, `"boundaries"`, and `"emitted_messages"`
-
-        Notes:
-            - If `self.config.pre_compress` is True, messages will first be token-compressed before segmentation.
-            - If `self.config.topic_segment` is disabled, the function returns early with segmentation info only.
-            - Memory extraction results are wrapped into `MemoryEntry` objects containing timestamps,
-              weekdays, and extracted factual content.
-            - Depending on `self.config.update`, the function triggers either online or offline memory updates.
         """
-        import time as _time
         extract_prompts = normalize_extraction_prompts(
             prompts=METADATA_GENERATE_PROMPT,
             extraction_mode=self.config.extraction_mode,
             logger=self.logger
         )
-        
+
         call_id = f"add_memory_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
         self._last_activity_time = datetime.now().timestamp()
@@ -357,20 +329,17 @@ class LightMemory:
             "add_output_prompt": [],
             "api_call_nums": 0
         }
-        # --- Stage timings for this call ---
-        _t_compress = 0.0
-        _t_segment = 0.0
-        _t_llm_extract = 0.0
-        _t_db_insert = 0.0
 
         tenant = self._get_tenant(user_id)
         
         self.logger.debug(f"[{call_id}] Raw input type: {type(messages)}")
         if isinstance(messages, list):
             self.logger.debug(f"[{call_id}] Raw input sample: {json.dumps(messages)}")
+
         normalizer = MessageNormalizer(offset_ms=500)
         msgs = normalizer.normalize_messages(messages)
         self.logger.debug(f"[{call_id}] Normalized messages sample: {json.dumps(msgs)}")
+
         if self.config.pre_compress:
             if hasattr(self.compressor, "tokenizer") and self.compressor.tokenizer is not None:
                 args = (msgs, self.compressor.tokenizer)
@@ -396,14 +365,20 @@ class LightMemory:
                     target_rate = cfg.entropy_config.get('compress_rate')
                 elif hasattr(cfg, 'compress_config') and isinstance(cfg.compress_config, dict):
                     target_rate = cfg.compress_config.get('rate')
+
             self.logger.info(f"[{call_id}] Target compression rate: {target_rate}")
             self.logger.debug(f"[{call_id}] Compressed messages sample: {json.dumps(compressed_messages)}")
+
+        elif getattr(self.config, "pre_compress_streaming", False):
+            self.logger.debug(
+                f"[{call_id}] Streaming pre-compression path active; assuming input is already compressed"
+            )
+            compressed_messages = msgs
         else:
             compressed_messages = msgs
             self.logger.info(f"[{call_id}] Pre-compression disabled, using normalized messages")
-        
+
         if not self.config.topic_segment:
-            # TODO:
             self.logger.info(f"[{call_id}] Topic segmentation disabled, returning emitted messages")
             return {
                 "triggered": True,
@@ -588,7 +563,10 @@ class LightMemory:
         call_id = f"offline_update_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
         self.logger.info(f"[{call_id}] Received {len(memory_list)} memory entries")
-        self.logger.info(f"[{call_id}] construct_update_queue_trigger={construct_update_queue_trigger}, offline_update_trigger={offline_update_trigger}")
+        self.logger.info(
+            f"[{call_id}] construct_update_queue_trigger={construct_update_queue_trigger}, "
+            f"offline_update_trigger={offline_update_trigger}"
+        )
 
         if self.config.index_strategy in ["context", "hybrid"]:
             self.logger.info(f"[{call_id}] Saving memory entries to file (strategy: {self.config.index_strategy})")
@@ -631,37 +609,28 @@ class LightMemory:
             self.logger.info(f"[{call_id}] Successfully inserted {inserted_count} entries to vector database")
             if construct_update_queue_trigger:
                 self.logger.info(f"[{call_id}] Triggering update queue construction")
-                self.construct_update_queue_all_entries(
-                    top_k=20,
-                    keep_top_n=10
-                )
-            
+                self.construct_update_queue_all_entries(top_k=20, keep_top_n=10)
+
             if offline_update_trigger:
                 self.logger.info(f"[{call_id}] Triggering offline update for all entries")
-                self.offline_update_all_entries(
-                    update_sim_threshold = 0.8
-                )
+                self.offline_update_all_entries(update_sim_threshold=0.8)
 
     def construct_update_queue_all_entries(self, top_k: int = 20, keep_top_n: int = 10, max_workers: int = 8):
-
         """
         Offline update all entries in parallel using multithreading.
         Each entry updates its own update_queue based on entries with earlier timestamps.
-
-        Args:
-            top_k (int): Number of nearest neighbors to consider for each entry.
-            keep_top_n (int): Number of top entries to keep in update_queue.
-            max_workers (int): Maximum number of threads to use.
         """
         call_id = f"construct_queue_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
         self.logger.info(f"[{call_id}] Parameters: top_k={top_k}, keep_top_n={keep_top_n}, max_workers={max_workers}")
+
         all_entries = self.embedding_retriever.get_all()
         self.logger.info(f"[{call_id}] Retrieved {len(all_entries)} entries from vector database")
         if not all_entries:
             self.logger.warning(f"[{call_id}] No entries found in database, skipping queue construction")
             self.logger.info(f"========== END {call_id} ==========")
             return
+
         updated_count = 0
         skipped_count = 0
         nonempty_queue_count = 0
@@ -674,9 +643,12 @@ class LightMemory:
             payload = entry["payload"]
             vec = entry.get("vector")
             ts = payload.get("float_time_stamp", None)
-            
+
             if vec is None or ts is None:
-                self.logger.debug(f"[{call_id}] Skipping entry {eid}: missing vector={vec is None}, float_time_stamp={ts is None} ({ts})")
+                self.logger.debug(
+                    f"[{call_id}] Skipping entry {eid}: missing vector={vec is None}, "
+                    f"float_time_stamp={ts is None} ({ts})"
+                )
                 with lock:
                     skipped_count += 1
                 return
@@ -703,21 +675,25 @@ class LightMemory:
             if update_queue:
                 with lock:
                     nonempty_queue_count += 1
-                self.logger.debug(f"[{call_id}] Entry {eid} update_queue length={len(update_queue)} top_candidates=" + str(update_queue[:3]))
+                self.logger.debug(
+                    f"[{call_id}] Entry {eid} update_queue length={len(update_queue)} "
+                    f"top_candidates={update_queue[:3]}"
+                )
             else:
                 with lock:
                     empty_queue_count += 1
-                self.logger.debug(f"[{call_id}] Entry {eid} has no candidates after filtering (hits may be only itself)")
+                self.logger.debug(f"[{call_id}] Entry {eid} has no candidates after filtering")
 
             with self._db_write_lock:
                 self.embedding_retriever.update(vector_id=eid, vector=vec, payload=new_payload)
 
             with lock:
                 updated_count += 1
-        self.logger.info(f"[{call_id}] Starting parallel queue construction with {max_workers} workers")
 
+        self.logger.info(f"[{call_id}] Starting parallel queue construction with {max_workers} workers")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             executor.map(_update_queue_construction, all_entries)
+
         self.logger.info(
             f"[{call_id}] Queue construction completed: {updated_count} updated, {skipped_count} skipped, "
             f"nonempty_queues={nonempty_queue_count}, empty_queues={empty_queue_count}"
@@ -727,21 +703,18 @@ class LightMemory:
     def offline_update_all_entries(self, score_threshold: float = 0.9, max_workers: int = 5):
         """
         Perform offline updates for all entries based on their update_queue, in parallel.
-
-        Args:
-            score_threshold (float): Minimum similarity score for considering update candidates.
-            max_workers (int): Maximum number of worker threads.
         """
         call_id = f"offline_update_all_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        
         self.logger.info(f"========== START {call_id} ==========")
         self.logger.info(f"[{call_id}] Parameters: score_threshold={score_threshold}, max_workers={max_workers}")
+
         all_entries = self.embedding_retriever.get_all()
         self.logger.info(f"[{call_id}] Retrieved {len(all_entries)} entries from vector database")
         if not all_entries:
             self.logger.warning(f"[{call_id}] No entries found in database, skipping offline update")
             self.logger.info(f"========== END {call_id} ==========")
             return
+
         processed_count = 0
         updated_count = 0
         deleted_count = 0
@@ -752,14 +725,13 @@ class LightMemory:
             "calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            "total_tokens": 0,
-            "total_time": 0.0,
-            "errors": 0
+            "total_tokens": 0
         }
         token_lock = threading.Lock()
+
         def update_entry(entry):
             nonlocal processed_count, updated_count, deleted_count, skipped_count
-            
+
             eid = entry["id"]
             payload = entry["payload"]
 
@@ -783,30 +755,19 @@ class LightMemory:
 
             if updated_entry is None:
                 return
-            # ====== token consumption ======
-            usage = updated_entry.get("usage")
-            if usage:
-                time_taken = usage.get("time_taken", 0.0)
-                if time_taken > 0:
-                    with token_lock:
-                        update_token_stats["calls"] += 1
-                        update_token_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                        update_token_stats["completion_tokens"] += usage.get("completion_tokens", 0)
-                        update_token_stats["total_tokens"] += usage.get("total_tokens", 0)
-                        update_token_stats["total_time"] += time_taken
-                    
-                    self.logger.debug(
-                        f"[{call_id}] Update LLM call for {eid} - "
-                        f"Tokens: {usage.get('total_tokens', 0)}"
-                    )
-                else:
-                    with token_lock:
-                        update_token_stats["errors"] += 1
-                    self.logger.warning(f"[{call_id}] Update LLM call for {eid} failed or returned 0 latency, skipping statistics.")
-            else:
-                with token_lock:
-                    update_token_stats["errors"] += 1
-            # ==================== token consumption ====================
+
+            usage = updated_entry["usage"]
+            with token_lock:
+                update_token_stats["calls"] += 1
+                update_token_stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                update_token_stats["completion_tokens"] += usage.get("completion_tokens", 0)
+                update_token_stats["total_tokens"] += usage.get("total_tokens", 0)
+
+            self.logger.debug(
+                f"[{call_id}] Update LLM call for {eid} - "
+                f"Tokens: {usage.get('total_tokens', 0)}"
+            )
+
             action = updated_entry.get("action")
             if action == "delete":
                 with self._db_write_lock:
@@ -823,28 +784,22 @@ class LightMemory:
                 with lock:
                     updated_count += 1
                 self.logger.debug(f"[{call_id}] Updated entry: {eid}")
+
         self.logger.info(f"[{call_id}] Starting parallel offline update with {max_workers} workers")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             executor.map(update_entry, all_entries)
-        with lock:
-            processed_count_final = processed_count
-            updated_count_final = updated_count
-            deleted_count_final = deleted_count
-            skipped_count_final = skipped_count
 
-        with self._token_stats_lock:
+        with lock:
             self.token_stats["update_calls"] += update_token_stats["calls"]
             self.token_stats["update_prompt_tokens"] += update_token_stats["prompt_tokens"]
             self.token_stats["update_completion_tokens"] += update_token_stats["completion_tokens"]
-            self.token_stats["update_total_tokens"] += update_token_stats["total_tokens"]    
-            self.token_stats["update_time"] = self.token_stats.get("update_time", 0.0) + update_token_stats["total_time"]
-            self.token_stats["update_errors"] += update_token_stats["errors"]
-        
+            self.token_stats["update_total_tokens"] += update_token_stats["total_tokens"]
+
         self.logger.info(f"[{call_id}] Offline update completed:")
-        self.logger.info(f"[{call_id}]   - Processed: {processed_count_final} entries")
-        self.logger.info(f"[{call_id}]   - Updated: {updated_count_final} entries")
-        self.logger.info(f"[{call_id}]   - Deleted: {deleted_count_final} entries")
-        self.logger.info(f"[{call_id}]   - Skipped (no candidates): {skipped_count_final} entries")
+        self.logger.info(f"[{call_id}]   - Processed: {processed_count} entries")
+        self.logger.info(f"[{call_id}]   - Updated: {updated_count} entries")
+        self.logger.info(f"[{call_id}]   - Deleted: {deleted_count} entries")
+        self.logger.info(f"[{call_id}]   - Skipped (no candidates): {skipped_count} entries")
         self.logger.info(
             f"[{call_id}]   - Update API calls: {update_token_stats['calls']}, "
             f"Total tokens: {update_token_stats['total_tokens']}"
@@ -865,19 +820,16 @@ class LightMemory:
             list[str]: A list of formatted strings containing time_stamp, weekday, and memory.
         """
         call_id = f"retrieve_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        
         self.logger.info(f"========== START {call_id} ==========")
         self._last_activity_time = datetime.now().timestamp()
         self.logger.info(f"[{call_id}] Query: {query}")
         self.logger.info(f"[{call_id}] Parameters: limit={limit}, filters={filters}")
+
         self.logger.debug(f"[{call_id}] Generating embedding for query")
         query_vector = self.text_embedder.embed(query)
         self.logger.debug(f"[{call_id}] Query embedding dimension: {len(query_vector)}")
-        if filters is None:
-            filters = {}
-        filters["user_id"] = user_id
-        
-        self.logger.info(f"[{call_id}] Searching vector database for user {user_id}")
+
+        self.logger.info(f"[{call_id}] Searching vector database")
         results = self.embedding_retriever.search(
             query_vector=query_vector,
             limit=limit,
@@ -885,6 +837,7 @@ class LightMemory:
             return_full=True,
         )
         self.logger.info(f"[{call_id}] Found {len(results)} results")
+
         formatted_results = []
         for r in results:
             payload = r.get("payload", {})
@@ -892,7 +845,7 @@ class LightMemory:
             weekday = payload.get("weekday", "")
             memory = payload.get("memory", "")
             formatted_results.append(f"{time_stamp} {weekday} {memory}")
-            
+
         result_string = "\n".join(formatted_results)
         self.logger.info(f"[{call_id}] Formatted {len(formatted_results)} results into output string")
         self.logger.debug(f"[{call_id}] Output string length: {len(result_string)} characters")
@@ -900,7 +853,7 @@ class LightMemory:
         return result_string
 
     def get_token_statistics(self):
-        embedder_stats = {"total_calls": 0, "total_tokens": None, "total_time": 0.0}
+        embedder_stats = {"total_calls": 0, "total_tokens": None}
         if hasattr(self, 'text_embedder') and hasattr(self.text_embedder, 'get_stats'):
             embedder_stats = self.text_embedder.get_stats()
             
@@ -1014,14 +967,17 @@ class LightMemory:
             build_empty_result
         )
         global GLOBAL_LAST_SUMMARY_TIME
-        
+
         call_id = f"summarize_{'all' if process_all else 'once'}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.logger.info(f"========== START {call_id} ==========")
+
         if not self.summary_retriever:
             raise ValueError("Summarization not enabled. Set 'summary_collection_name' in config.")
+
         summaries = [] if process_all else None
         total_entries = 0 if process_all else None
         iteration = 0
+
         while True:
             iteration += 1
             self.logger.info(f"[{call_id}] Iteration {iteration}")
@@ -1033,6 +989,7 @@ class LightMemory:
                 )
                 if GLOBAL_LAST_SUMMARY_TIME is None:
                     return build_empty_result(process_all)
+
             Cbuf, has_more, new_time = get_window_entries(
                 retriever=self.embedding_retriever,
                 current_time=GLOBAL_LAST_SUMMARY_TIME,
@@ -1040,6 +997,7 @@ class LightMemory:
                 call_id=call_id,
                 logger=self.logger
             )
+
             if Cbuf is None:
                 if new_time is not None:
                     GLOBAL_LAST_SUMMARY_TIME = new_time
@@ -1050,6 +1008,7 @@ class LightMemory:
                         break
                 else:
                     return build_empty_result(process_all, has_more=has_more)
+
             self.logger.info(f"[{call_id}] Processing {len(Cbuf)} entries")
             Sk = []
             if enable_cross_event:
@@ -1068,6 +1027,7 @@ class LightMemory:
                     logger=self.logger
                 )
                 self.logger.debug(f"[{call_id}] Retrieved {len(Sk)} seeds")
+
             has_entry_type = any(e["payload"].get("entry_type") for e in Cbuf)
             buffer_text = format_entries_for_prompt(Cbuf, include_type_tag=has_entry_type)
             supplementary_text = format_entries_for_prompt(Sk, include_type_tag=has_entry_type)
@@ -1076,6 +1036,7 @@ class LightMemory:
                 e["payload"].get("speaker_name") or e["payload"].get("speaker_id") or "?"
                 for e in Cbuf
             ))
+
             summary_text = call_summary_llm(
                 manager=self.manager,
                 buffer_text=buffer_text,
@@ -1084,10 +1045,10 @@ class LightMemory:
                 speakers=speakers,
                 custom_prompt=SUMMARY_PROMPT,
                 token_stats=self.token_stats,
-                logger=self.logger,
-                lock=self._token_stats_lock
+                logger=self.logger
             )
             self.logger.debug(f"[{call_id}] Generated {len(summary_text)} chars")
+
             summary_id = store_summary(
                 summary_text=summary_text,
                 buffer_entries=Cbuf,
@@ -1096,6 +1057,7 @@ class LightMemory:
                 text_embedder=self.text_embedder,
                 logger=self.logger
             )
+
             GLOBAL_LAST_SUMMARY_TIME = mark_entries_and_get_next_time(
                 retriever=self.embedding_retriever,
                 entries=Cbuf,
@@ -1116,6 +1078,7 @@ class LightMemory:
                 result = build_single_result(summary_text, summary_id, Cbuf, Sk, has_more)
                 self.logger.info(f"========== END {call_id} ==========")
                 return result
+
         result = build_batch_result(summaries, total_entries, call_id, self.logger)
         self.logger.info(f"========== END {call_id} ==========")
         return result

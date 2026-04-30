@@ -331,7 +331,7 @@ def _memory_manager_config_ollama() -> dict:
         "configs": {
             "model": os.getenv("OLLAMA_MODEL_NAME"),
             "host":  os.getenv("OLLAMA_HOST"),
-            "max_tokens": 16384,
+            "max_tokens": 512,
         },
     }
 
@@ -342,7 +342,7 @@ def _memory_manager_config_gemini() -> dict:
         "configs": {
             "model":      os.getenv("GEMINI_MODEL_NAME"),
             "api_key":    os.getenv("GEMINI_API_KEY"),
-            "max_tokens": 16384,
+            "max_tokens": 512,
         },
     }
 
@@ -367,9 +367,10 @@ def _memory_manager_config_openai() -> dict:
     return {
         "model_name": "openai",
         "configs": {
-            "model":      os.getenv("OPENAI_MODEL_NAME"),
-            "api_key":    os.getenv("OPENAI_API_KEY"),
-            "max_tokens": 16384,
+            "model": os.getenv("OPENAI_MODEL_NAME", "openrouter/free"),
+            "api_key": os.getenv("OPENAI_API_KEY"),
+            "openai_base_url": "https://openrouter.ai/api/v1",
+            "max_tokens": 512,
         },
     }
 
@@ -524,7 +525,36 @@ def load_lightmem(collection_name: str) -> LightMemory:
 
 
 def reset_stats(mem):
-    mem.reset_token_statistics()
+    if hasattr(mem, "reset_token_statistics"):
+        mem.reset_token_statistics()
+    else:
+        mem.token_stats = {
+            "add_memory_calls": 0,
+            "add_memory_prompt_tokens": 0,
+            "add_memory_completion_tokens": 0,
+            "add_memory_total_tokens": 0,
+            "add_memory_time": 0.0,
+            "update_calls": 0,
+            "update_prompt_tokens": 0,
+            "update_completion_tokens": 0,
+            "update_total_tokens": 0,
+            "update_time": 0.0,
+            "embedding_calls": 0,
+            "embedding_total_tokens": 0,
+            "embedding_time": 0.0,
+            "summarize_calls": 0,
+            "summarize_prompt_tokens": 0,
+            "summarize_completion_tokens": 0,
+            "summarize_total_tokens": 0,
+            "summarize_time": 0.0,
+            "stage_compress_time": 0.0,
+            "stage_segment_time": 0.0,
+            "stage_llm_extract_time": 0.0,
+            "stage_db_insert_time": 0.0,
+        }
+
+    if hasattr(mem, "text_embedder") and hasattr(mem.text_embedder, "reset_stats"):
+        mem.text_embedder.reset_stats()
 
 
 print(f"Initializing LightMem with provider: {CONFIG['provider']} ...")

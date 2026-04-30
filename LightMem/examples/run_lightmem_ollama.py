@@ -5,6 +5,7 @@ import time
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
+from lightmem.memory.lightmem import LightMemory
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -12,13 +13,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import dotenv
 dotenv.load_dotenv()
 
-from lightmem.memory.lightmem import LightMemory
-
-
 # =========== Ollama Configuration ============
 your_ollama_model_name = "gemma3:12b-cloud"  # such as "llama3:latest"
 your_ollama_JUDGE_model_name = "gemma3:12b-cloud"  # such as "gemma3:latest"
 your_ollama_host = "http://localhost:11434"  # default Ollama host is "http://localhost:11434"
+
 your_ollama_options_stable = {
     "num_ctx": 8192,  # set according to the model's context window
     "seed": 42,
@@ -36,6 +35,34 @@ EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH")
 DATA_PATH=os.getenv("DATA_PATH")
 QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR")
 
+# make sure dataset exists; try to download from HuggingFace if missing
+if not os.path.isfile(DATA_PATH):
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise ImportError(
+            "huggingface_hub is not installed. Install with `pip install huggingface_hub` "
+            "or provide the dataset manually at DATA_PATH."
+        )
+
+    print(f"Dataset not found at {DATA_PATH}, downloading from Hugging Face Hub...")
+    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+
+    # choose the exact split file you want
+    downloaded_file = hf_hub_download(
+        repo_id="xiaowu0162/longmemeval-cleaned",
+        repo_type="dataset",
+        filename="longmemeval_s_cleaned.json",   # or longmemeval_m_cleaned.json
+        local_dir=os.path.dirname(DATA_PATH),
+        local_dir_use_symlinks=False,
+    )
+
+    # optional: copy/rename to your DATA_PATH
+    if downloaded_file != DATA_PATH:
+        import shutil
+        shutil.copyfile(downloaded_file, DATA_PATH)
+
+    print(f"Downloaded dataset to {DATA_PATH}")
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     if not abstention:
@@ -218,7 +245,7 @@ def main():
         lightmem = load_lightmem(collection_name=item["question_id"])
         sessions = item["haystack_sessions"][:10]
         timestamps = item["haystack_dates"][:10]
-
+# )t;
         results_list = []
 
         time_start = time.time()

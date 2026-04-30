@@ -7,6 +7,15 @@ class LlmLingua2Segmenter:
     def __init__(self, config: Any = None, shared: bool = False, compressor=None):
         self.config = config
 
+        if shared is False or compressor is None:
+            self.model = AutoModel.from_pretrained(
+                pretrained_model_name_or_path=self.config.get("model_name"),
+                device_map=self.config.get("device_map", None),
+                torch_dtype=self.config.get("torch_dtype", None),
+                **self.config.get("model_config", {})
+            ).eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.get("model_name"))
+            self.buffer_len = self.config.get("buffer_len", 512)
         if getattr(self.config, 'use_server', False):
             self.server_url = self.config.server_url
             self.model = None

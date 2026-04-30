@@ -2,6 +2,7 @@ import threading
 import requests
 from typing import Dict, Optional, List, Union, Any
 from transformers import PreTrainedTokenizerBase
+import copy
 
 from lightmem.configs.pre_compressor.llmlingua_2 import LlmLingua2Config
 
@@ -17,7 +18,7 @@ class LlmLingua2Compressor:
 
         try:
             import importlib
-            importlib.import_module('llmlingua')
+            importlib.import_module("llmlingua")
         except ImportError:
             raise ImportError(
                 "Required package 'llmlingua' not found. "
@@ -28,17 +29,17 @@ class LlmLingua2Compressor:
         self._lock = threading.Lock()
         try:
             from llmlingua import PromptCompressor
-            if config.llmlingua_config['use_llmlingua2'] is True:
+            if config.llmlingua_config["use_llmlingua2"] is True:
                 self._compressor = PromptCompressor(
-                    model_name=config.llmlingua_config['model_name'],
-                    device_map=config.llmlingua_config['device_map'],
-                    use_llmlingua2=config.llmlingua_config['use_llmlingua2'],
-                    llmlingua2_config=config.llmlingua2_config
+                    model_name=config.llmlingua_config["model_name"],
+                    device_map=config.llmlingua_config["device_map"],
+                    use_llmlingua2=config.llmlingua_config["use_llmlingua2"],
+                    llmlingua2_config=config.llmlingua2_config,
                 )
             else:
                 self._compressor = PromptCompressor(
-                    model_name=config.llmlingua_config['model_name'],
-                    device_map=config.llmlingua_config['device_map']
+                    model_name=config.llmlingua_config["model_name"],
+                    device_map=config.llmlingua_config["device_map"],
                 )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize LlmLingua2Compressor: {str(e)}")
@@ -120,89 +121,81 @@ class LlmLingua2Compressor:
         messages: List[Dict[str, str]],
         tokenizer: Union[PreTrainedTokenizerBase, Any, None],
     ) -> List[Dict[str, str]]:
-        # TODO: Consider adding an extra field in the message, compressed_content, and put the compressed content in this field while keeping content unchanged.
         """
         Compress the content of each message.
 
-        Args:
-            messages: List of message dicts containing 'role' and 'content'.
-            tokenizer: Tokenizer to check token length after compression.
-
-        Returns:
-            List of messages with compressed content.
+        Returns a deep-copied compressed list and does not mutate the input.
         """
-        for mes in messages:
-            content = mes.get('content', '')
+        compressed_messages = copy.deepcopy(messages)
+
+        for mes in compressed_messages:
+            content = mes.get("content", "")
             if not content or not content.strip():
-                # If content is empty, it doesn't need compression
                 continue
 
-            if getattr(self.config, 'use_server', False):
-                try:
-                    response = requests.post(
-                        self.server_url, 
-                        json={
-                            "contexts": [content],
-                            "rate": self.config.compress_config.get('rate', 0.8),
-                            "target_token": self.config.compress_config.get('target_token', -1)
-                        },
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    comp_content = response.json()["compressed_prompts"][0]
-                except Exception as e:
-                    print(f"Server single compress error, skip this message: {e}")
-                    comp_content = content
-            else:
-                compress_config = {
-                    'context': [content],
-                    **self.config.compress_config
-                }
-    
-                try:
-                    with self._lock:
-                        comp_content = self._compressor.compress_prompt(**compress_config)['compressed_prompt']
-                except Exception as e:
-                    print(f"compress error, skip this message: {e}")
-                    comp_content = content  # Keep the original content if compression fails
+            compress_config = {
+                "context": [content],
+                **self.config.compress_config,
+            }
 
-            # Check if the compressed content is still too long
+            try:
+                comp_content = self._compressor.compress_prompt(**compress_config)["compressed_prompt"]
+            except Exception as e:
+                print(f"compress error, skip this message: {e}")
+                comp_content = content
+
             if tokenizer is not None:
-                try:
-                    while len(tokenizer.encode(comp_content)) >= 512 and comp_content.strip():
-                        if getattr(self.config, 'use_server', False):
+                while len(tokenizer.encode(comp_content)) >= 512 and comp_content.strip():
+                    try:
+                        if getattr(self.config, "use_server", False):
                             response = requests.post(
-                                self.server_url, 
+                                self.server_url,
                                 json={
                                     "contexts": [comp_content],
-                                    "rate": self.config.compress_config.get('rate', 0.8),
-                                    "target_token": self.config.compress_config.get('target_token', -1)
+                                    "rate": self.config.compress_config.get("rate", 0.8),
+                                    "target_token": self.config.compress_config.get("target_token", -1),
                                 },
-                                timeout=30
+                                timeout=30,
                             )
                             response.raise_for_status()
                             comp_content = response.json()["compressed_prompts"][0]
+
                         else:
                             new_compress_config = {
-                                'context': comp_content,
-                                **self.config.compress_config
+                                "context": [comp_content],  # IMPORTANT: must be list
+                                **self.config.compress_config,
                             }
                             with self._lock:
-                                comp_content = self._compressor.compress_prompt(**new_compress_config)['compressed_prompt']
-                except Exception as e:
-                    print(f"secondary compress error: {e}")
-                    # If an error occurs, exit the loop and keep the current compression result
-                    break
+                                comp_content = self._compressor.compress_prompt(**new_compress_config)[
+                                    "compressed_prompt"
+                                ]
 
-            # Update message
+                    except Exception as e:
+                        print(f"secondary compress error: {e}")
+                        break
+
             if comp_content.strip():
-                mes['content'] = comp_content.strip()
+                mes["content"] = comp_content.strip()
 
-        return messages
+        return compressed_messages
+
+    def compress_with_stats(
+        self,
+        messages: List[Dict[str, str]],
+        tokenizer: Union[PreTrainedTokenizerBase, Any, None],
+    ):
+        raw_chars = sum(len(m.get("content", "")) for m in messages)
+        compressed_messages = self.compress(messages, tokenizer)
+        compressed_chars = sum(len(m.get("content", "")) for m in compressed_messages)
+
+        stats = {
+            "num_messages": len(messages),
+            "raw_chars": raw_chars,
+            "compressed_chars": compressed_chars,
+            "compression_ratio": (compressed_chars / raw_chars if raw_chars > 0 else 1.0),
+        }
+        return compressed_messages, stats
 
     @property
     def inner_compressor(self):
-        """
-        Access the underlying PromptCompressor instance directly.
-        """
         return self._compressor
