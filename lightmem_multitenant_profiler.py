@@ -177,7 +177,7 @@ def parse_args():
     parser.add_argument("--concurrency-limit", type=int, default=10)
     parser.add_argument("--skip-history", action="store_true")
     parser.add_argument("--skip-queries", action="store_true")
-
+    parser.add_argument("--autonomous-sleep", action="store_true", help="Enable autonomous sleep detection and consolidation.")
     # Dataset Slicing
     parser.add_argument("--start-date", type=str, default="")
     parser.add_argument("--end-date", type=str, default="")
@@ -814,9 +814,9 @@ def setup_lightmem(args):
             "update": "offline" if args.provider == "vllm" else "sync",
             "logging": {"level": "ERROR"},
             "extraction_concurrency": args.concurrency_limit,
+            "autonomous_sleep": args.autonomous_sleep
         }
     )
-
 
 _BUILDERS = {
     "ollama": lambda args: {

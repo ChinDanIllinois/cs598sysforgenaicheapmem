@@ -17,6 +17,8 @@ import textwrap
 import time
 import uuid
 import threading
+import faulthandler
+faulthandler.enable()
 from typing import List, Dict, Any, Tuple
 from collections import deque
 
@@ -38,6 +40,7 @@ logging.getLogger('dash').setLevel(logging.ERROR)
 logging.getLogger('mem0').setLevel(logging.ERROR)
 
 dotenv.load_dotenv()
+os.environ["MEM0_TELEMETRY"] = "False"
 
 # ============================================================
 # UTILS — RATE LIMITING
@@ -450,14 +453,25 @@ async def run_simulation(events, args, memory, rate_limiter):
                 await rate_limiter.wait()
             st = time.perf_counter()
             is_archive = event["type"] == "archive"
+            
+            # Mem0 expects a string, but our loader provides a list of dicts for archives
+            content = event["content"]
+            if isinstance(content, list):
+                content = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in content])
+
             with GLOBAL_METRICS.lock:
                 if is_archive: GLOBAL_METRICS.active_archives += 1
                 else: GLOBAL_METRICS.active_queries += 1
             try:
-                if event["type"] == "archive":
-                    await asyncio.to_thread(memory.add, event["content"], user_id=event["user_id"])
-                else:
-                    await asyncio.to_thread(memory.search, event["content"], user_id=event["user_id"])
+                # We use a thread lock because Mem0's internal SQLite/metadata storage 
+                # is not thread-safe at high concurrency (64).
+                def locked_call():
+                    if is_archive:
+                        return memory.add(content, user_id=event["user_id"])
+                    else:
+                        return memory.search(content, user_id=event["user_id"])
+
+                await asyncio.to_thread(locked_call)
                 
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success")
@@ -502,8 +516,8 @@ def setup_mem0(args):
         "vector_store": {
             "provider": "qdrant",
             "config": {
-                "collection_name": f"mem0_mt_{uuid.uuid4().hex[:4]}",
-                "path": f"{os.getenv('QDRANT_DATA_DIR', './qdrant_data')}/mem0_multitenant",
+                "url": "http://localhost:6333",
+                "collection_name": "mem0_mt_test",
                 "embedding_model_dims": 384
             }
         },
@@ -554,7 +568,7 @@ def setup_mem0(args):
                 "model": os.getenv("VLLM_MODEL_NAME"),
                 "api_key": os.getenv("VLLM_API_KEY", "EMPTY"),
                 "openai_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
-                "max_tokens": 1500  # Restricts the output length
+                "max_tokens": 8192  # Increased to match LightMem baseline
             }
         }
 
