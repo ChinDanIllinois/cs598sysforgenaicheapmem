@@ -439,6 +439,7 @@ async def run_simulation(events, args, memory, rate_limiter):
     mon_task = asyncio.create_task(monitor_throughput(GLOBAL_METRICS, stop_mon))
     tasks = []
     user_locks = {}
+    sqlite_lock = threading.Lock()
     
     async def run_event(event):
         uid = event["user_id"]
@@ -450,14 +451,23 @@ async def run_simulation(events, args, memory, rate_limiter):
                 await rate_limiter.wait()
             st = time.perf_counter()
             is_archive = event["type"] == "archive"
+            
+            # Mem0 expects a string, but our loader provides a list of dicts for archives
+            content = event["content"]
+            if isinstance(content, list):
+                content = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in content])
+
             with GLOBAL_METRICS.lock:
                 if is_archive: GLOBAL_METRICS.active_archives += 1
                 else: GLOBAL_METRICS.active_queries += 1
             try:
-                if event["type"] == "archive":
-                    await asyncio.to_thread(memory.add, event["content"], user_id=event["user_id"])
-                else:
-                    await asyncio.to_thread(memory.search, event["content"], user_id=event["user_id"])
+                # We use a thread lock because Mem0's internal SQLite/metadata storage 
+                # is not thread-safe at high concurrency (64).
+                with sqlite_lock:
+                    if is_archive:
+                        await asyncio.to_thread(memory.add, content, user_id=event["user_id"])
+                    else:
+                        await asyncio.to_thread(memory.search, content, user_id=event["user_id"])
                 
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success")
