@@ -5,7 +5,7 @@ import concurrent
 import logging
 import json
 import threading
-import time
+import time as _time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Literal, Optional, List, Tuple, Union
 
@@ -679,13 +679,8 @@ class LightMemory:
         updated_count = 0
         deleted_count = 0
         skipped_count = 0
-<<<<<<< HEAD
-        lock = threading.Lock()
-        write_lock = threading.Lock()
-=======
         lock = threading.Lock() # still needed for local counters below
         
->>>>>>> origin/AutonomousSleepDet
         update_token_stats = {
             "calls": 0,
             "prompt_tokens": 0,
