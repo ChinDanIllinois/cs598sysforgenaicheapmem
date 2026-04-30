@@ -28,6 +28,15 @@ from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
 
+import logging
+import flask.cli
+
+# Suppress Flask / Dash / Werkzeug banner and logs
+flask.cli.show_server_banner = lambda *args: None
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('flask').setLevel(logging.ERROR)
+logging.getLogger('dash').setLevel(logging.ERROR)
+
 import os
 import dotenv
 dotenv.load_dotenv()
@@ -82,8 +91,31 @@ def parse_args():
     parser.add_argument(
         "--provider",
         required=True,
-        choices=["ollama", "gemini", "openai", "mock"],
+        choices=["ollama", "gemini", "openai", "vllm", "mock"],
         help="LLM backend provider to use for memory management.",
+    )
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=1,
+        help="LLM batch size for compatible providers (e.g., vllm). Default: 1 (no batching).",
+    )
+    parser.add_argument(
+        "--llm-batch-timeout",
+        type=int,
+        default=10,
+        help="LLM batch timeout in seconds. Default: 10.",
+    )
+    parser.add_argument(
+        "--vllm-adaptive-shaping",
+        action="store_true",
+        help="Enable adaptive request shaping for vLLM (monitors engine metrics).",
+    )
+    parser.add_argument(
+        "--vllm-metrics-url",
+        type=str,
+        default="",
+        help="Custom metrics URL for vLLM (defaults to VLLM_BASE_URL/metrics).",
     )
     parser.add_argument(
         "--rpm",
@@ -186,6 +218,16 @@ _PROVIDER_ENV_VARS = {
             "Obtain one at https://platform.openai.com/api-keys",
         ),
     ],
+    "vllm": [
+        (
+            "VLLM_MODEL_NAME",
+            "The vLLM model identifier (e.g. 'Qwen/Qwen2.5-3B-Instruct').",
+        ),
+        (
+            "VLLM_BASE_URL",
+            "The URL for the vLLM server (e.g. 'http://localhost:8000/v1').",
+        ),
+    ],
     "mock": [],
 }
 
@@ -252,6 +294,7 @@ _MODEL_NAME_ENV = {
     "ollama": "OLLAMA_MODEL_NAME",
     "gemini": "GEMINI_MODEL_NAME",
     "openai": "OPENAI_MODEL_NAME",
+    "vllm": "VLLM_MODEL_NAME",
     "mock": "MOCK_MODEL_NAME"
 }
 _resolved_model_name = os.getenv(_MODEL_NAME_ENV[args.provider], "unknown")
@@ -264,6 +307,10 @@ CONFIG = {
     "test_seconds":       args.test_seconds,
     "dashboard_port":     args.port,
     "rpm":                args.rpm,
+    "llm_batch_size":     args.llm_batch_size,
+    "llm_batch_timeout":  args.llm_batch_timeout,
+    "vllm_adaptive_shaping": args.vllm_adaptive_shaping,
+    "vllm_metrics_url":   args.vllm_metrics_url,
 }
 
 rate_limiter = AsyncRateLimiter(CONFIG["rpm"])
@@ -300,6 +347,22 @@ def _memory_manager_config_gemini() -> dict:
     }
 
 
+def _memory_manager_config_vllm() -> dict:
+    return {
+        "model_name": "vllm",
+        "configs": {
+            "model":      os.getenv("VLLM_MODEL_NAME"),
+            "api_key":    os.getenv("VLLM_API_KEY", "EMPTY"),
+            "max_tokens": 16384,
+            "vllm_base_url": os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+            "llm_batch_size": CONFIG["llm_batch_size"],
+            "llm_batch_timeout": CONFIG["llm_batch_timeout"],
+            "vllm_adaptive_shaping": CONFIG["vllm_adaptive_shaping"],
+            "vllm_metrics_url": CONFIG["vllm_metrics_url"] if CONFIG["vllm_metrics_url"] else None,
+        },
+    }
+
+
 def _memory_manager_config_openai() -> dict:
     return {
         "model_name": "openai",
@@ -325,6 +388,7 @@ _MEMORY_MANAGER_BUILDERS = {
     "ollama": _memory_manager_config_ollama,
     "gemini": _memory_manager_config_gemini,
     "openai": _memory_manager_config_openai,
+    "vllm":   _memory_manager_config_vllm,
     "mock":   _memory_manager_config_mock,
 }
 
@@ -338,7 +402,7 @@ def load_dataset(data_path: str):
     Load all (messages, timestamp) pairs from LongMemEval dataset.
     Returns a flat list of turn_messages lists ready for add_memory.
     """
-    with open(data_path, "r") as f:
+    with open(data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     samples = []
@@ -381,10 +445,10 @@ def get_current_timestamp():
     return now.strftime(f"%Y/%m/%d ({now.strftime('%a')}) %H:%M:%S")
 
 
-def get_sample(worker_id: int, i: int):
+def get_sample(worker_id: int, concurrency: int, i: int):
     """Return a message list for this worker's i-th request."""
     if DATASET:
-        idx = (worker_id * 10007 + i) % len(DATASET)
+        idx = (worker_id * 70 * concurrency + i) % len(DATASET)
         return DATASET[idx]
     return [
         {
@@ -530,11 +594,11 @@ total_attempts = 0
 # WORKERS
 # ============================================================
 
-async def worker(worker_id, stop_event):
+async def worker(worker_id, concurrency, stop_event):
     global total_writes, total_latency, total_errors, total_attempts
     i = 0
     while not stop_event.is_set():
-        messages = get_sample(worker_id, i)
+        messages = get_sample(worker_id, concurrency, i)
         start_t  = time.perf_counter()
         with metrics_lock:
             total_attempts += 1
@@ -542,12 +606,18 @@ async def worker(worker_id, stop_event):
             # Respect RPM throttle
             await rate_limiter.wait()
 
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 memory.add_memory,
                 messages=messages,
+                user_id=f"worker_{worker_id}",
                 force_segment=True,
                 force_extract=True,
             )
+            
+            # Wait for backend extraction worker to finish if enqueued
+            if isinstance(result, dict) and "extraction_future" in result:
+                await asyncio.wrap_future(result["extraction_future"])
+
             duration = time.perf_counter() - start_t
             with metrics_lock:
                 total_writes  += 1
@@ -590,7 +660,7 @@ async def run_single_concurrency(concurrency):
     live_errors_per_sec.clear()
 
     stop_event = asyncio.Event()
-    workers    = [asyncio.create_task(worker(i, stop_event)) for i in range(concurrency)]
+    workers    = [asyncio.create_task(worker(i, concurrency, stop_event)) for i in range(concurrency)]
 
     start       = time.perf_counter()
     last_sample = start
@@ -761,10 +831,12 @@ _PROVIDER_LABEL = {
     "ollama": f"Ollama ({os.getenv('OLLAMA_MODEL_NAME', 'unknown')})",
     "gemini": f"Gemini ({os.getenv('GEMINI_MODEL_NAME', 'unknown')})",
     "openai": f"OpenAI ({os.getenv('OPENAI_MODEL_NAME', 'unknown')})",
+    "vllm":   f"vLLM ({os.getenv('VLLM_MODEL_NAME', 'unknown')})",
     "mock":   "Mock Provider (Simulated)",
 }
 
 app = Dash(__name__)
+app.logger.setLevel(logging.ERROR)
 app.title = f"LightMem Profiler — {CONFIG['provider'].capitalize()}"
 
 app.layout = html.Div([

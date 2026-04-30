@@ -20,6 +20,16 @@ class LlmLingua2Config(BaseModel):
         description="Advanced configuration for LLMLingua-2 (batch size, token control)"
     )
 
+    use_server: bool = Field(
+        default=False,
+        description="Whether to use an external LLMLingua-2 serving engine (e.g., a FastAPI server) to bypass Python GIL limitations."
+    )
+
+    server_url: str = Field(
+        default="http://localhost:8080/compress",
+        description="The URL of the external LLMLingua-2 serving engine. Only used if use_server is True."
+    )
+
     compress_config: Dict[str, Any] = Field(
         default={
             "instruction": "",

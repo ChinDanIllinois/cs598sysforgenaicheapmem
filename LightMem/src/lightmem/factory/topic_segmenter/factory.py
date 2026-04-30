@@ -36,10 +36,7 @@ class TopicSegmenterFactory:
             module_path, class_name = class_path.rsplit('.', 1)
             module = import_module(module_path)
             segmenter_class = getattr(module, class_name)
-            if config.configs is None:
-                return segmenter_class()
-            else:
-                return segmenter_class(config=config.configs, shared = shared, compressor = compressor)
+            return segmenter_class(config=config, shared = shared, compressor = compressor)
             
         except ImportError as e:
             raise ImportError(

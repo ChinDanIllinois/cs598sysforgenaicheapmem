@@ -30,6 +30,7 @@ class MemoryEntry:
     hit_time: int = 0
     update_queue: List = field(default_factory=list)
     consolidated: bool = False
+    user_id: Optional[str] = None
     
 def clean_response(response: str) -> List[Dict[str, Any]]:
     """
@@ -154,6 +155,7 @@ def save_memory_entries(memory_entries, file_path="memory_entries.json"):
             "speaker_id": getattr(entry, "speaker_id", ""),  
             "speaker_name": getattr(entry, "speaker_name", ""),  
             "consolidated": getattr(entry, "consolidated", False),  
+            "user_id": getattr(entry, "user_id", None),
         }
 
     if os.path.exists(file_path):
@@ -242,7 +244,15 @@ def convert_extraction_results_to_memory_entries(
                 fact_list = [fact_list]
 
             for fact_entry in fact_list:
-                original_sid = int(fact_entry.get("source_id", 0))
+                if not isinstance(fact_entry, dict):
+                    continue
+                
+                # We know fact_entry is a dict now, but we should handle if source_id is missing or invalid type
+                try:
+                    original_sid = int(fact_entry.get("source_id", 0))
+                except (ValueError, TypeError):
+                    original_sid = 0
+                    
                 sid = original_sid
                 
                 if max_valid_sid is not None and sid > max_valid_sid:
@@ -257,10 +267,11 @@ def convert_extraction_results_to_memory_entries(
                 seq_candidate = sid * 2
                 
                 if seq_candidate not in topic_id_map:
+                    range_info = f"{min(topic_id_map.keys())}-{max(topic_id_map.keys())}" if topic_id_map else "None"
                     logger.error(
                         f"sequence {seq_candidate} (from corrected source_id={sid}) "
                         f"not found in topic_id_map. "
-                        f"Available range: {min(topic_id_map.keys())}-{max(topic_id_map.keys())}. "
+                        f"Available range: {range_info}. "
                         f"Skipping this fact."
                     )
                     continue
@@ -345,6 +356,7 @@ def _create_memory_entry_from_fact(
         topic_id=topic_id,
         topic_summary=topic_summary,
         consolidated=False, 
+        user_id=None,
     )
     
     return mem_obj

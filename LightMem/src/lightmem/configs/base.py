@@ -120,4 +120,20 @@ class BaseMemoryConfigs(BaseModel):
                     "- 'flat': Extract factual entries only (independent units)\n"
                     "- 'event': Extract event-level structure (factual + relational, temporally bound)"
     )
+    extraction_concurrency: Optional[int] = Field(
+        default=32,
+        description="Maximum number of parallel extraction threads in the background worker."
+    )
+    autonomous_sleep: Optional[bool] = Field(
+        default=False,
+        description="If True, enables a system-managed background thread for autonomous sleep detection and consolidation."
+    )
+    sleep_idle_threshold_sec: Optional[int] = Field(
+        default=300,
+        description="Time in seconds before system is considered 'idle'."
+    )
+    sleep_check_interval_sec: Optional[int] = Field(
+        default=60,
+        description="How often the background thread checks the status."
+    )
 

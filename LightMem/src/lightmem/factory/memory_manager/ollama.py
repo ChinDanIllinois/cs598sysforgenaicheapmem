@@ -195,6 +195,8 @@ class OllamaManager:
                     messages=messages,
                     response_format="json"
                 )
+                if raw_response is None:
+                    raise ValueError("API returned None response due to timeout or error.")
                 cleaned_result = clean_response(raw_response)
                 return {
                     "input_prompt": messages,
