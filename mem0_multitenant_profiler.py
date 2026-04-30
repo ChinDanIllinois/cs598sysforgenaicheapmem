@@ -463,11 +463,14 @@ async def run_simulation(events, args, memory, rate_limiter):
             try:
                 # We use a thread lock because Mem0's internal SQLite/metadata storage 
                 # is not thread-safe at high concurrency (64).
-                with sqlite_lock:
-                    if is_archive:
-                        await asyncio.to_thread(memory.add, content, user_id=event["user_id"])
-                    else:
-                        await asyncio.to_thread(memory.search, content, user_id=event["user_id"])
+                def locked_call():
+                    with sqlite_lock:
+                        if is_archive:
+                            return memory.add(content, user_id=event["user_id"])
+                        else:
+                            return memory.search(content, user_id=event["user_id"])
+
+                await asyncio.to_thread(locked_call)
                 
                 with GLOBAL_METRICS.lock:
                     GLOBAL_METRICS.record(event["type"], event["user_id"], time.perf_counter() - st, "success")
