@@ -5,7 +5,7 @@ import concurrent
 import logging
 import json
 import threading
-import time
+import time as _time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Literal, Optional, List, Tuple, Union
 
