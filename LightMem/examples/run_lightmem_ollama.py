@@ -6,12 +6,17 @@ from tqdm import tqdm
 from typing import Dict, List, Optional
 
 from lightmem.memory.lightmem import LightMemory
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import dotenv
+dotenv.load_dotenv()
 
 # =========== Ollama Configuration ============
-your_ollama_model_name      = "phi"            # or whatever Phi release you pulled
-your_ollama_JUDGE_model_name= "phi"            # judge can be same or different
-your_ollama_host            = "http://localhost:11434"
+your_ollama_model_name = "gemma3:12b-cloud"  # such as "llama3:latest"
+your_ollama_JUDGE_model_name = "gemma3:12b-cloud"  # such as "gemma3:latest"
+your_ollama_host = "http://localhost:11434"  # default Ollama host is "http://localhost:11434"
 
 your_ollama_options_stable = {
     "num_ctx": 8192,  # set according to the model's context window
@@ -23,11 +28,12 @@ your_ollama_options_stable = {
 }  # a stable settings of options for evaluation
 
 # ============ Small Model Paths ============
-LLMLINGUA_MODEL_PATH = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
-EMBEDDING_MODEL_PATH = "sentence-transformers/all-MiniLM-L6-v2"
+LLMLINGUA_MODEL_PATH=os.getenv("LLMLINGUA_MODEL_PATH")
+EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH")
+
 # ============ Data Configuration ============
-DATA_PATH='/Users/ambikasharan/Desktop/lightmem/LightMem/experiments/longmemeval/longmemeval_s.json'
-QDRANT_DATA_DIR='../qdrant_data'
+DATA_PATH=os.getenv("DATA_PATH")
+QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR")
 
 # make sure dataset exists; try to download from HuggingFace if missing
 if not os.path.isfile(DATA_PATH):
@@ -234,10 +240,11 @@ def main():
     }
 
     for item in tqdm(data):
-        print(item["question_id"])
+        item["question"] = "What fitness goal am I working towards?"
+        print(item["question"])
         lightmem = load_lightmem(collection_name=item["question_id"])
         sessions = item["haystack_sessions"][:10]
-        timestamps = item["haystack_dates"]
+        timestamps = item["haystack_dates"][:10]
 # )t;
         results_list = []
 
