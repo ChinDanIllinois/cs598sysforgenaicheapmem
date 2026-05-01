@@ -16,6 +16,8 @@ ACCENT5    = "#8b5cf6"
 ACCENT6    = "#9333ea"
 ACCENT7    = "#e5e7eb"
 ACCENT8    = "#db2777"
+ACCENT9    = "#e2e8f0"
+ACCENT10   = "#64748b"
 ACCENT_ERR = "#ef4444"
 TEXT       = "#e2e8f0"
 TEXT_DIM   = "#64748b"
@@ -23,13 +25,14 @@ TEXT_DIM   = "#64748b"
 # Color palette for comparison
 COLORS = {
     "mem0": ACCENT,
-    "baseline": ACCENT2,
-    "sleep": ACCENT3,
-    "batching": ACCENT4,
-    "batch+sleep": ACCENT5,
-    "fixed batch 2": ACCENT6,
-    "fixed batch 16": ACCENT7,
-    "baseline 2": ACCENT8
+    "0 (baseline)": ACCENT2,
+    "1 (streaming precompress)": ACCENT3,
+    "2 (sleep)": ACCENT4,
+    "3 (batching)": ACCENT5,
+    "1+2": ACCENT6,
+    "1+3": ACCENT7,
+    "2+3": ACCENT8,
+    "full system": ACCENT9
 }
 
 FILE_MAPPING = {
@@ -37,34 +40,53 @@ FILE_MAPPING = {
         "lat": "final_baselines/mem0_multitenant_run_vllm_c32_b1_rpm0_dur120_20260430_050852.csv",
         "tput": "final_baselines/mem0_multitenant_run_vllm_c32_b1_rpm0_dur120_20260430_050852_throughput.csv"
     },
-    "baseline": {
+    "0 (baseline)": {
         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_043354_baseline_lat.csv",
         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_043354_throughput_baseline.csv"
     },
-    "sleep": {
+    "2 (sleep)": {
         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_051221_sleep_lat.csv",
         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_051221_throughput_sleep.csv"
     },
-    "batching": {
+    "3 (batching)": {
         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_adaptive_20260430_045447.csv",
         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_adaptive_20260430_045447_throughput.csv"
     },
-    "batch+sleep": {
+    "2+3": {
         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_adaptive_20260430_054518_and_sleep_lat.csv",
         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_adaptive_20260430_054518_throughput_and_sleep.csv"
     },
-    "fixed batch 2": {
-        "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b2_rpm0_dur120_20260430_064151_fixed_batch_2.csv",
-        "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b2_rpm0_dur120_20260430_064151_throughput_fixed_batch_2.csv"
+    "1 (streaming precompress)":
+    {
+        "lat": "final_baselines/precomp.csv",
+        "tput": "final_baselines/precomp_tput.csv"
     },
-    "fixed batch 16": {
-        "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_20260430_065404_fixed_batch_16.csv",
-        "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_20260430_065404_throughput_fixed_batch_16.csv"
+    "1+3": {
+        "lat": "final_baselines/precomp+batch.csv",
+        "tput": "final_baselines/precomp+batch_tput.csv"
     },
-    "baseline 2": {
-        "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_070359_baseline_2.csv",
-        "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_070359_throughput_baseline_2.csv"
+    "1+2":
+    {
+        "lat": "final_baselines/precomp+sleep.csv",
+        "tput": "final_baselines/precomp+sleep_tput.csv"
+    },
+    "full system":
+    {
+        "lat": "final_baselines/streaming_precompress_local_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_adaptive_streampre_20260430_225609.csv",
+        "tput": "final_baselines/streaming_precompress_local_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_adaptive_streampre_20260430_225609_throughput.csv"
     }
+#     "fixed batch 2": {
+#         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b2_rpm0_dur120_20260430_064151_fixed_batch_2.csv",
+#         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b2_rpm0_dur120_20260430_064151_throughput_fixed_batch_2.csv"
+#     },
+#     "fixed batch 16": {
+#         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_20260430_065404_fixed_batch_16.csv",
+#         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b16_rpm0_dur120_20260430_065404_throughput_fixed_batch_16.csv"
+#     },
+#     "baseline 2": {
+#         "lat": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_070359_baseline_2.csv",
+#         "tput": "final_baselines/multitenant_run_vllm_Qwen2-5-7B-Instruct_c64_b1_rpm0_dur120_20260430_070359_throughput_baseline_2.csv"
+#     }
 }
 
 PLOT_LAYOUT = dict(
