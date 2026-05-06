@@ -28,12 +28,12 @@ your_vllm_options_stable = {
 } 
 
 # ============ Small Model Paths ============
-LLMLINGUA_MODEL_PATH=os.getenv("LLMLINGUA_MODEL_PATH")
-EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH")
+LLMLINGUA_MODEL_PATH=os.getenv("LLMLINGUA_MODEL_PATH", "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank")
+EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH", "sentence-transformers/all-MiniLM-L6-v2")
 
 # ============ Data Configuration ============
-DATA_PATH=os.getenv("DATA_PATH")
-QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR")
+DATA_PATH=os.getenv("DATA_PATH", os.path.join(os.path.dirname(__file__), "longmemeval_s_cleaned.json"))
+QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR", "./qdrant_data")
 
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
@@ -81,6 +81,8 @@ def true_or_false(response):
 def load_lightmem(collection_name):
     config = {
         "pre_compress": True,
+        "pre_compress_streaming": os.getenv("STREAMING_PRECOMPRESS", "0") == "1",
+        "autonomous_sleep": os.getenv("AUTONOMOUS_SLEEP", "0") == "1",
         "pre_compressor": {
             "model_name": "llmlingua-2",
             "configs": {
@@ -109,7 +111,7 @@ def load_lightmem(collection_name):
                 "vllm_base_url": your_vllm_base_url,
                 "api_key": your_vllm_api_key,
                 "max_tokens": 4096,
-                "llm_batch_size": 16,
+                "llm_batch_size": int(os.getenv("BATCH_SIZE", "16")),
                 "llm_batch_timeout": 10,
             }
         },
@@ -205,7 +207,7 @@ def main():
     llm_judge = llm
 
     data = json.load(open(DATA_PATH, "r")) if DATA_PATH else []
-    data = data[:1]  # for testing
+    data = data[:10]  # Test first 10 for evaluation
 
     INIT_RESULT = {
         "add_input_prompt": [],
@@ -214,13 +216,13 @@ def main():
     }
 
     for item in tqdm(data):
-        item["question"] = "What fitness goal am I working towards?"
         print(item["question"])
         lightmem = load_lightmem(collection_name=item["question_id"])
-        sessions = item.get("haystack_sessions", [])[:10]
-        timestamps = item.get("haystack_dates", [])[:10]
+        sessions = item.get("haystack_sessions", [])
+        timestamps = item.get("haystack_dates", [])
 
         results_list = []
+        futures = []
 
         time_start = time.time()
         for session, timestamp in zip(sessions, timestamps):
@@ -238,11 +240,22 @@ def main():
                 )
                 result = lightmem.add_memory(
                     messages=turn_messages,
+                    user_id=item["question_id"],
                     force_segment=is_last_turn,
                     force_extract=is_last_turn,
                 )
                 if result != INIT_RESULT:
-                    results_list.append(result)
+                    if "extraction_future" in result:
+                        futures.append(result["extraction_future"])
+                    else:
+                        results_list.append(result)
+
+        # Wait for all async extractions to complete before retrieving
+        for fut in futures:
+            try:
+                results_list.append(fut.result())
+            except Exception as e:
+                print(f"Error extracting memory: {e}")
 
         time_end = time.time()
         construction_time = time_end - time_start
