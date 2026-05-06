@@ -260,7 +260,7 @@ def main():
         time_end = time.time()
         construction_time = time_end - time_start
 
-        related_memories = lightmem.retrieve(item["question"], limit=20)
+        related_memories = lightmem.retrieve(item["question"], user_id=item["question_id"], limit=20)
         messages = []
         messages.append({"role": "system", "content": "You are a helpful assistant."})
         messages.append({
