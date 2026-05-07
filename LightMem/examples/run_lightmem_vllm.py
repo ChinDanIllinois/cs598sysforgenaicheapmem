@@ -88,7 +88,7 @@ def load_lightmem(collection_name):
             "configs": {
                 "llmlingua_config": {
                     "model_name": LLMLINGUA_MODEL_PATH,
-                    "device_map": "cpu",
+                    "device_map": "cuda",
                     "use_llmlingua2": True,
                 },
                 "compress_config": {
@@ -122,7 +122,7 @@ def load_lightmem(collection_name):
             "configs": {
                 "model": EMBEDDING_MODEL_PATH,
                 "embedding_dims": 384,
-                "model_kwargs": {"device": "cpu"},
+                "model_kwargs": {"device": "cuda"},
             },
         },
         "retrieve_strategy": "embedding",
@@ -207,7 +207,7 @@ def main():
     llm_judge = llm
 
     data = json.load(open(DATA_PATH, "r")) if DATA_PATH else []
-    data = data[:1]  # Test first 1 for quick verification
+    data = data[:10]  # Test 10 items on GPU for efficiency
 
     INIT_RESULT = {
         "add_input_prompt": [],
