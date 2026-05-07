@@ -131,7 +131,7 @@ def load_lightmem(collection_name):
             "configs": {
                 "collection_name": collection_name,
                 "embedding_model_dims": 384,
-                "path": f'{QDRANT_DATA_DIR}/{collection_name}',
+                "path": QDRANT_DATA_DIR,
             }
         },
         "update": "offline",
@@ -226,10 +226,10 @@ def main():
         # Reset state for new question
         lightmem.clear_memory()
         
-        # Dynamically update the retriever's collection/path for this question
-        # This ensures we have a clean vector database for each question
-        lightmem.embedding_retriever.configs.collection_name = item["question_id"]
-        lightmem.embedding_retriever.configs.path = f"{QDRANT_DATA_DIR}/{item['question_id']}"
+        # Dynamically update the retriever's collection for this question
+        # This ensures we have a clean collection for each question in the shared DB
+        lightmem.embedding_retriever.collection_name = item["question_id"]
+        lightmem.embedding_retriever.create_col(384, on_disk=True)
         
         sessions = item.get("haystack_sessions", [])
         timestamps = item.get("haystack_dates", [])
