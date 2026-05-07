@@ -207,7 +207,7 @@ def main():
     llm_judge = llm
 
     data = json.load(open(DATA_PATH, "r")) if DATA_PATH else []
-    data = data[:10]  # Test first 10 for evaluation
+    data = data[:1]  # Test first 1 for quick verification
 
     INIT_RESULT = {
         "add_input_prompt": [],
