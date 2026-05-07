@@ -213,11 +213,24 @@ def main():
         "add_input_prompt": [],
         "add_output_prompt": [],
         "api_call_nums": 0
-    }
+    }    
+    total_correct = 0
+    total_samples = 0
+
+    # Initialize once to stay on GPU
+    lightmem = load_lightmem(collection_name="eval_session")
 
     for item in tqdm(data):
-        print(item["question"])
-        lightmem = load_lightmem(collection_name=item["question_id"])
+        print(f"\nEvaluating: {item['question']}")
+        
+        # Reset state for new question
+        lightmem.clear_memory()
+        
+        # Dynamically update the retriever's collection/path for this question
+        # This ensures we have a clean vector database for each question
+        lightmem.embedding_retriever.config.collection_name = item["question_id"]
+        lightmem.embedding_retriever.config.path = f"{QDRANT_DATA_DIR}/{item['question_id']}"
+        
         sessions = item.get("haystack_sessions", [])
         timestamps = item.get("haystack_dates", [])
 
@@ -281,6 +294,8 @@ def main():
         response = llm_judge.call(messages)
 
         correct = 1 if true_or_false(response) else 0
+        total_correct += correct
+        total_samples += 1
 
         save_data = {
             "question_id": item["question_id"],
@@ -294,6 +309,20 @@ def main():
         filename = os.path.join(out_dir, f"result_{item['question_id']}.json")
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(save_data, f, ensure_ascii=False, indent=4)
+
+    # Shutdown background threads at the very end
+    lightmem.stop()
+
+    if total_samples > 0:
+        accuracy = (total_correct / total_samples) * 100
+        print("\n" + "="*40)
+        print("FINAL ACCURACY RESULTS")
+        print("="*40)
+        print(f"Total Questions Processed: {total_samples}")
+        print(f"Correct Answers:          {total_correct}")
+        print(f"Overall Accuracy:         {accuracy:.2f}%")
+        print(f"Detailed logs saved in:   {out_dir}")
+        print("="*40)
 
 
 if __name__ == "__main__":
