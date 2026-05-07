@@ -136,7 +136,7 @@ def load_lightmem(collection_name):
         },
         "update": "offline",
         "logging": {
-            "level": "INFO",
+            "level": "ERROR",
             "file_enabled": True,
             "log_dir": "logs",
             "log_filename_prefix": "run_vllm",
@@ -220,15 +220,28 @@ def main():
     lightmem = load_lightmem(collection_name="eval_session")
 
     all_results = []
-    for item in tqdm(data):
-        print(f"\nEvaluating: {item['question']}")
+    for item in tqdm(data, desc="Evaluating", unit="question"):
+        question_id = item["question_id"]
+        result_filename = os.path.join(out_dir, f"result_{question_id}.json")
         
+        # Checkpoint: Skip if already processed
+        if os.path.exists(result_filename):
+            try:
+                with open(result_filename, "r", encoding="utf-8") as f:
+                    checkpoint_data = json.load(f)
+                    all_results.append(checkpoint_data)
+                    total_correct += checkpoint_data.get("correct", 0)
+                    total_samples += 1
+                    continue
+            except Exception as e:
+                print(f"Error loading checkpoint for {question_id}: {e}")
+
         # Reset state for new question
         lightmem.clear_memory()
         
         # Dynamically update the retriever's collection for this question
         # This ensures we have a clean collection for each question in the shared DB
-        lightmem.embedding_retriever.collection_name = item["question_id"]
+        lightmem.embedding_retriever.collection_name = question_id
         lightmem.embedding_retriever.create_col(384, on_disk=True)
         
         sessions = item.get("haystack_sessions", [])
@@ -253,7 +266,7 @@ def main():
                 )
                 result = lightmem.add_memory(
                     messages=turn_messages,
-                    user_id=item["question_id"],
+                    user_id=question_id,
                     force_segment=is_last_turn,
                     force_extract=is_last_turn,
                 )
@@ -273,7 +286,7 @@ def main():
         time_end = time.time()
         construction_time = time_end - time_start
 
-        related_memories = lightmem.retrieve(item["question"], user_id=item["question_id"], limit=20)
+        related_memories = lightmem.retrieve(item["question"], user_id=question_id, limit=20)
         messages = []
         messages.append({"role": "system", "content": "You are a helpful assistant."})
         messages.append({
@@ -282,7 +295,7 @@ def main():
         })
         generated_answer = llm.call(messages)
 
-        if 'abs' in item["question_id"]:
+        if 'abs' in question_id:
             prompt = get_anscheck_prompt(
                 item["question_type"], item["question"], item.get("answer", ""), generated_answer, abstention=True
             )
@@ -298,13 +311,18 @@ def main():
         total_samples += 1
 
         save_data = {
-            "question_id": item["question_id"],
+            "question_id": question_id,
             "results": results_list,
             "construction_time": construction_time,
             "generated_answer": generated_answer,
             "ground_truth": item.get("answer", ""),
             "correct": correct,
         }
+        
+        # Save individual result for checkpointing
+        with open(result_filename, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=4)
+            
         all_results.append(save_data)
 
     # Save all results to a single file at the end
