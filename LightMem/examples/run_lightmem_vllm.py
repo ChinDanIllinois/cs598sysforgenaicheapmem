@@ -207,7 +207,6 @@ def main():
     llm_judge = llm
 
     data = json.load(open(DATA_PATH, "r")) if DATA_PATH else []
-    data = data[:10]  # Test 10 items on GPU for efficiency
 
     INIT_RESULT = {
         "add_input_prompt": [],
@@ -220,6 +219,7 @@ def main():
     # Initialize once to stay on GPU
     lightmem = load_lightmem(collection_name="eval_session")
 
+    all_results = []
     for item in tqdm(data):
         print(f"\nEvaluating: {item['question']}")
         
@@ -305,10 +305,12 @@ def main():
             "ground_truth": item.get("answer", ""),
             "correct": correct,
         }
+        all_results.append(save_data)
 
-        filename = os.path.join(out_dir, f"result_{item['question_id']}.json")
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=4)
+    # Save all results to a single file at the end
+    final_report_path = os.path.join(out_dir, "final_evaluation_report.json")
+    with open(final_report_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=4)
 
     # Shutdown background threads at the very end
     lightmem.stop()
