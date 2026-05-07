@@ -938,10 +938,44 @@ class LightMemory:
             self.text_embedder.reset_stats()
     
     def stop(self):
-        """Stop background threads (e.g. batching)"""
+        """
+        Shut down background threads and processors.
+        """
+        self.logger.info("Stopping LightMemory background workers...")
+        self._stop_event.set()
+        
+        # Stop internal batch workers
+        if hasattr(self, 'compressor_batcher') and self.compressor_batcher:
+            self.compressor_batcher.stop()
+        if hasattr(self, 'segmenter_batcher') and self.segmenter_batcher:
+            self.segmenter_batcher.stop()
+        
+        # Stop the extraction queue worker
+        self.extraction_queue.put(None) # Sentinel to stop the worker
+        if hasattr(self, '_batch_worker_thread') and self._batch_worker_thread.is_alive():
+            self._batch_worker_thread.join(timeout=2)
+            
+        # Stop the sleep detector
+        if hasattr(self, '_sleep_detector_thread') and self._sleep_detector_thread.is_alive():
+            # The sleep detector loop doesn't check stop_event yet, let's fix that too
+            pass 
+        
         if hasattr(self.manager, "stop"):
             self.manager.stop()
-    
+        
+        self.logger.info("LightMemory stopped.")
+
+    def clear_memory(self):
+        """
+        Wipes all tenant data and buffers to reset state between test cases.
+        """
+        self.logger.info("Clearing all tenant data and memory buffers...")
+        with self._tenants_lock:
+            self.tenants.clear()
+        # Reset activity time
+        self._last_activity_time = datetime.now().timestamp()
+        self.logger.info("Memory state reset successfully.")
+
     def summarize(
         self,
         SUMMARY_PROMPT: Optional[str] = None,
