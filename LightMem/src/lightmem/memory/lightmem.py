@@ -159,6 +159,10 @@ class LightMemory:
         self._tenants: Dict[str, TenantState] = {}
         self._tenants_lock = threading.Lock()
         self.extraction_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._consolidation_lock = threading.Lock()
+        self._is_consolidating = False
+        self._last_activity_time = time.time() # Use time.time() for consistency with other parts
         
         if self.config.pre_compress:
             self.logger.info("Initializing pre-compressor")
