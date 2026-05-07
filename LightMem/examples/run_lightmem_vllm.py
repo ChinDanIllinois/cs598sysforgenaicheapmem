@@ -228,8 +228,8 @@ def main():
         
         # Dynamically update the retriever's collection/path for this question
         # This ensures we have a clean vector database for each question
-        lightmem.embedding_retriever.config.collection_name = item["question_id"]
-        lightmem.embedding_retriever.config.path = f"{QDRANT_DATA_DIR}/{item['question_id']}"
+        lightmem.embedding_retriever.configs.collection_name = item["question_id"]
+        lightmem.embedding_retriever.configs.path = f"{QDRANT_DATA_DIR}/{item['question_id']}"
         
         sessions = item.get("haystack_sessions", [])
         timestamps = item.get("haystack_dates", [])
