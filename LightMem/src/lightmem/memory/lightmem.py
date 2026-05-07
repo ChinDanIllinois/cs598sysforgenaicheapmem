@@ -971,7 +971,7 @@ class LightMemory:
         """
         self.logger.info("Clearing all tenant data and memory buffers...")
         with self._tenants_lock:
-            self.tenants.clear()
+            self._tenants.clear()
         # Reset activity time
         self._last_activity_time = datetime.now().timestamp()
         self.logger.info("Memory state reset successfully.")
