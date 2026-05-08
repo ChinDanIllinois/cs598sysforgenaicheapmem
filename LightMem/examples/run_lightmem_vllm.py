@@ -344,9 +344,11 @@ def main():
             stats["total_samples"] += 1
 
     # Use ThreadPoolExecutor for parallel processing
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        list(tqdm(executor.map(process_question, data), total=len(data), desc="Evaluating", unit="question"))
+        futures = [executor.submit(process_question, item) for item in data]
+        for _ in tqdm(as_completed(futures), total=len(data), desc="Evaluating", unit="question"):
+            pass
 
     # Save all results to a single file at the end
     final_report_path = os.path.join(out_dir, "final_evaluation_report.json")
