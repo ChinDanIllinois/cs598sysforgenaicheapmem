@@ -34,8 +34,8 @@ EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH", "sentence-transformers/al
 
 # ============ Data Configuration ============
 DATA_PATH=os.getenv("DATA_PATH", os.path.join(os.path.dirname(__file__), "longmemeval_s_cleaned.json"))
-QDRANT_URL=os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_API_KEY=os.getenv("QDRANT_API_KEY", "")
+QDRANT_HOST=os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT=int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION=os.getenv("QDRANT_COLLECTION", "eval_collection")
 NUM_WORKERS=int(os.getenv("NUM_WORKERS", "4"))
 
@@ -135,8 +135,8 @@ def load_lightmem(collection_name):
             "configs": {
                 "collection_name": collection_name,
                 "embedding_model_dims": 384,
-                "url": QDRANT_URL,
-                "api_key": QDRANT_API_KEY,
+                "host": QDRANT_HOST,
+                "port": QDRANT_PORT,
             }
         },
         "update": "offline",
