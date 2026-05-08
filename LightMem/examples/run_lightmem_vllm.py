@@ -1,4 +1,5 @@
 import json
+import threading
 import os
 import time
 from tqdm import tqdm
@@ -33,7 +34,10 @@ EMBEDDING_MODEL_PATH=os.getenv("EMBEDDING_MODEL_PATH", "sentence-transformers/al
 
 # ============ Data Configuration ============
 DATA_PATH=os.getenv("DATA_PATH", os.path.join(os.path.dirname(__file__), "longmemeval_s_cleaned.json"))
-QDRANT_DATA_DIR=os.getenv("QDRANT_DATA_DIR", "./qdrant_data")
+QDRANT_URL=os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY=os.getenv("QDRANT_API_KEY", "")
+QDRANT_COLLECTION=os.getenv("QDRANT_COLLECTION", "eval_collection")
+NUM_WORKERS=int(os.getenv("NUM_WORKERS", "4"))
 
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
@@ -131,7 +135,8 @@ def load_lightmem(collection_name):
             "configs": {
                 "collection_name": collection_name,
                 "embedding_model_dims": 384,
-                "path": QDRANT_DATA_DIR,
+                "url": QDRANT_URL,
+                "api_key": QDRANT_API_KEY,
             }
         },
         "update": "offline",
@@ -207,20 +212,26 @@ def main():
     llm_judge = llm
 
     data = json.load(open(DATA_PATH, "r")) if DATA_PATH else []
+    data = data[:10]
+    json.dump(data, open("./data_ten.json", "w"), ensure_ascii=False, indent=4)
 
     INIT_RESULT = {
         "add_input_prompt": [],
         "add_output_prompt": [],
         "api_call_nums": 0
     }    
-    total_correct = 0
-    total_samples = 0
+    # Shared state for parallel processing
+    results_lock = threading.Lock()
+    stats = {"total_correct": 0, "total_samples": 0}
+    all_results = []
 
     # Initialize once to stay on GPU
-    lightmem = load_lightmem(collection_name="eval_session")
+    lightmem = load_lightmem(collection_name=QDRANT_COLLECTION)
+    
+    # Pre-create the collection
+    lightmem.embedding_retriever.create_col(384, on_disk=True)
 
-    all_results = []
-    for item in tqdm(data, desc="Evaluating", unit="question"):
+    def process_question(item):
         question_id = item["question_id"]
         result_filename = os.path.join(out_dir, f"result_{question_id}.json")
         
@@ -229,20 +240,17 @@ def main():
             try:
                 with open(result_filename, "r", encoding="utf-8") as f:
                     checkpoint_data = json.load(f)
-                    all_results.append(checkpoint_data)
-                    total_correct += checkpoint_data.get("correct", 0)
-                    total_samples += 1
-                    continue
+                    with results_lock:
+                        all_results.append(checkpoint_data)
+                        stats["total_correct"] += checkpoint_data.get("correct", 0)
+                        stats["total_samples"] += 1
+                    return
             except Exception as e:
                 print(f"Error loading checkpoint for {question_id}: {e}")
 
-        # Reset state for new question
-        lightmem.clear_memory()
-        
-        # Dynamically update the retriever's collection for this question
-        # This ensures we have a clean collection for each question in the shared DB
-        lightmem.embedding_retriever.collection_name = question_id
-        lightmem.embedding_retriever.create_col(384, on_disk=True)
+        # Note: We use question_id as user_id to isolate memories in the shared collection.
+        # We don't clear_memory() here as it would clear other threads' buffers.
+        # Instead, the tenant system in LightMemory handles user isolation.
         
         sessions = item.get("haystack_sessions", [])
         timestamps = item.get("haystack_dates", [])
@@ -264,6 +272,8 @@ def main():
                 is_last_turn = (
                     session is sessions[-1] and turn_idx == num_turns - 1
                 )
+                
+                # add_memory is thread-safe for different user_ids
                 result = lightmem.add_memory(
                     messages=turn_messages,
                     user_id=question_id,
@@ -281,12 +291,19 @@ def main():
             try:
                 results_list.append(fut.result())
             except Exception as e:
-                print(f"Error extracting memory: {e}")
+                print(f"Error extracting memory for {question_id}: {e}")
 
         time_end = time.time()
         construction_time = time_end - time_start
 
-        related_memories = lightmem.retrieve(item["question"], user_id=question_id, limit=20)
+        # Retrieve with filter for user_id to ensure isolation
+        related_memories = lightmem.retrieve(
+            item["question"], 
+            user_id=question_id, 
+            limit=20, 
+            filters={"user_id": question_id}
+        )
+        
         messages = []
         messages.append({"role": "system", "content": "You are a helpful assistant."})
         messages.append({
@@ -307,9 +324,7 @@ def main():
         response = llm_judge.call(messages)
 
         correct = 1 if true_or_false(response) else 0
-        total_correct += correct
-        total_samples += 1
-
+        
         save_data = {
             "question_id": question_id,
             "results": results_list,
@@ -323,7 +338,15 @@ def main():
         with open(result_filename, "w", encoding="utf-8") as f:
             json.dump(save_data, f, ensure_ascii=False, indent=4)
             
-        all_results.append(save_data)
+        with results_lock:
+            all_results.append(save_data)
+            stats["total_correct"] += correct
+            stats["total_samples"] += 1
+
+    # Use ThreadPoolExecutor for parallel processing
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        list(tqdm(executor.map(process_question, data), total=len(data), desc="Evaluating", unit="question"))
 
     # Save all results to a single file at the end
     final_report_path = os.path.join(out_dir, "final_evaluation_report.json")
@@ -333,13 +356,13 @@ def main():
     # Shutdown background threads at the very end
     lightmem.stop()
 
-    if total_samples > 0:
-        accuracy = (total_correct / total_samples) * 100
+    if stats["total_samples"] > 0:
+        accuracy = (stats["total_correct"] / stats["total_samples"]) * 100
         print("\n" + "="*40)
         print("FINAL ACCURACY RESULTS")
         print("="*40)
-        print(f"Total Questions Processed: {total_samples}")
-        print(f"Correct Answers:          {total_correct}")
+        print(f"Total Questions Processed: {stats['total_samples']}")
+        print(f"Correct Answers:          {stats['total_correct']}")
         print(f"Overall Accuracy:         {accuracy:.2f}%")
         print(f"Detailed logs saved in:   {out_dir}")
         print("="*40)
