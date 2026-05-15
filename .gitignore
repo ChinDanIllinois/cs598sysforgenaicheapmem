@@ -42,3 +42,4 @@ Thumbs.db
 
 .gitignore
 .env
+lightmem-venv/
