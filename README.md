@@ -130,5 +130,6 @@ python LightMem/examples/run_lightmem_vllm.py
 - `LightMem/src/lightmem/memory/lightmem.py`: Core LightMem memory management and multi-tenancy logic.
 - `LightMem/examples/run_lightmem_vllm.py`: Script for running accuracy evaluation tests with vLLM.
 - `llmlingua_server.py`: Server implementation for LLMLingua-2 context compression.
+- `visualize_baselines.py`: Script used to generate the following 2 files.
 - `baseline_comparison.html`: Comprehensive report visualizing performance comparisons between baseline and optimized runs.
 - `latency_breakdowns.html`: Detailed breakdown of latency components during profiling.```
